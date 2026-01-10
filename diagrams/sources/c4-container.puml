@@ -1,0 +1,56 @@
+@startuml c4-container
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Диаграмма контейнеров - Enterprise ML Platform
+
+Person(user, "Пользователь", "DS / MLE / Разработчик")
+
+System_Boundary(platform, "Enterprise ML Platform") {
+    Container(api_gw, "API Gateway", "Kong/Envoy", "Аутентификация, rate limiting, маршрутизация")
+    Container(web_ui, "Веб-консоль", "React", "UI управления")
+
+    Container(model_svc, "Model Service", "Python/FastAPI", "Реестр моделей, управление жизненным циклом")
+    Container(inference_svc, "Inference Service", "Python/Triton", "Обслуживание предсказаний, batching")
+    Container(deploy_svc, "Deployment Service", "Go/Temporal", "Оркестрация развёртывания")
+
+    ContainerDb(pg, "PostgreSQL", "PostgreSQL 15", "Метаданные, конфигурация")
+    ContainerDb(redis, "Redis", "Redis 7", "Кэш, rate limits")
+    ContainerQueue(kafka, "Kafka", "Apache Kafka", "Потоковая передача событий")
+    ContainerDb(s3, "Объектное хранилище", "MinIO/S3", "Артефакты моделей")
+}
+
+System_Ext(gpu_pool, "GPU Pool", "NVIDIA GPU для инференса")
+System_Ext(k8s, "Kubernetes", "Оркестрация контейнеров")
+System_Ext(prometheus, "Prometheus", "Сбор метрик")
+
+' Взаимодействия пользователя
+Rel(user, api_gw, "HTTPS/gRPC")
+Rel(user, web_ui, "HTTPS")
+Rel(web_ui, api_gw, "API вызовы")
+
+' Маршрутизация API Gateway
+Rel(api_gw, model_svc, "REST", "Управление моделями")
+Rel(api_gw, inference_svc, "gRPC", "Предсказания")
+
+' Model Service
+Rel(model_svc, pg, "SQL")
+Rel(model_svc, s3, "S3 API")
+Rel(model_svc, kafka, "События")
+
+' Inference Service
+Rel(inference_svc, redis, "Кэш")
+Rel(inference_svc, s3, "Загрузка моделей")
+Rel(inference_svc, gpu_pool, "Выполнение")
+Rel(inference_svc, kafka, "Метрики")
+
+' Deployment Service
+Rel(deploy_svc, kafka, "События")
+Rel(deploy_svc, k8s, "Развёртывание")
+Rel(deploy_svc, pg, "Состояние")
+
+' Внешние
+Rel(inference_svc, prometheus, "Метрики")
+
+@enduml

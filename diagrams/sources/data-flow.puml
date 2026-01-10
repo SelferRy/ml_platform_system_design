@@ -1,0 +1,83 @@
+@startuml data-flow
+title Диаграмма потоков данных - Enterprise ML Platform
+
+skinparam componentStyle rectangle
+
+' Внешние акторы
+actor "Data Scientist" as DS
+actor "Приложение" as App
+
+' Компоненты
+package "Входной слой" {
+    component [API Gateway] as GW
+    component [Веб-консоль] as UI
+}
+
+package "Сервисы" {
+    component [Model Service] as Model
+    component [Inference Service] as Inf
+    component [Deployment Service] as Deploy
+}
+
+package "Хранилища данных" {
+    database "PostgreSQL" as PG {
+        card "models"
+        card "versions"
+        card "deployments"
+        card "audit_logs"
+    }
+
+    database "Redis" as Redis {
+        card "prediction_cache"
+        card "rate_limits"
+    }
+
+    storage "S3/MinIO" as S3 {
+        card "model_artifacts"
+    }
+
+    queue "Kafka" as Kafka {
+        card "model_events"
+        card "deploy_events"
+        card "inference_metrics"
+    }
+}
+
+package "Инфраструктура" {
+    component [Kubernetes] as K8s
+    component [GPU Pool] as GPU
+    component [Prometheus] as Prom
+}
+
+' Потоки записи (синий)
+DS -[#blue]-> UI : "1. Загрузка модели"
+UI -[#blue]-> GW : "2. API запрос"
+GW -[#blue]-> Model : "3. Создание версии"
+Model -[#blue]-> PG : "4. Сохранение метаданных"
+Model -[#blue]-> S3 : "5. Сохранение артефакта"
+Model -[#blue]-> Kafka : "6. Отправка события"
+
+Deploy -[#blue]-> Kafka : "7. Consume события"
+Deploy -[#blue]-> K8s : "8. Развёртывание подов"
+Deploy -[#blue]-> PG : "9. Обновление состояния"
+
+' Потоки чтения (зелёный)
+App -[#green]-> GW : "A. Запрос предсказания"
+GW -[#green]-> Redis : "B. Проверка кэша"
+GW -[#green]-> Inf : "C. Переадресация запроса"
+Inf -[#green]-> GPU : "D. Выполнение модели"
+Inf -[#green]-> Kafka : "E. Логирование метрик"
+Inf -[#green]-> Redis : "F. Кэширование результата"
+
+' Поток monitoring (оранжевый)
+Inf -[#orange]-> Prom : "Метрики"
+K8s -[#orange]-> Prom : "Метрики"
+Prom -[#orange]-> PG : "Алерты"
+
+legend right
+  |<#blue>| Путь записи |
+  |<#green>| Путь чтения |
+  |<#orange>| Monitoring |
+endlegend
+
+@enduml

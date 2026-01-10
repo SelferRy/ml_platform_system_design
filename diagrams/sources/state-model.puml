@@ -1,0 +1,84 @@
+@startuml state-model
+title Конечный автомат жизненного цикла версии модели
+
+skinparam state {
+    BackgroundColor<<active>> LightGreen
+    BackgroundColor<<terminal>> LightGray
+    BackgroundColor<<error>> LightCoral
+    BorderColor Navy
+    ArrowColor Navy
+}
+
+[*] --> Draft : upload()
+
+state Draft {
+}
+
+state Validating {
+}
+
+state Staging <<active>> {
+}
+
+state Production <<active>> {
+}
+
+state Deprecated <<terminal>> {
+}
+
+state Failed <<error>> {
+}
+
+Draft --> Validating : deploy()
+Draft --> [*] : delete()
+
+Validating --> Staging : validation_passed()
+Validating --> Draft : validation_failed()
+Validating --> Failed : system_error()
+
+Staging --> Production : health_check_passed()
+Staging --> Draft : rollback()
+Staging --> Failed : deployment_failed()
+
+Production --> Deprecated : deprecate()
+Production --> Staging : rollback()
+
+Deprecated --> [*] : grace_period_expired()
+
+Failed --> Draft : retry()
+Failed --> [*] : delete()
+
+note right of Draft
+  Начальное состояние после загрузки.
+  Артефакт сохранён, не развёрнут.
+end note
+
+note right of Validating
+  Выполнение конвейера валидации:
+  - Проверка схемы
+  - Smoke test
+  - Сканирование безопасности
+end note
+
+note right of Staging
+  Развёрнут как canary (10% трафика).
+  Выполняются health checks.
+end note
+
+note right of Production
+  Обслуживает 100% production трафика.
+  Мониторится на предмет дрифта.
+end note
+
+note right of Deprecated
+  Grace period: 30 дней.
+  Клиенты уведомлены.
+  Нет нового трафика.
+end note
+
+note right of Failed
+  Развёртывание или валидация не удались.
+  Требуется расследование.
+end note
+
+@enduml

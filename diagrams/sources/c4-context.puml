@@ -1,0 +1,39 @@
+@startuml c4-context
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Диаграмма контекста системы - Enterprise ML Platform
+
+' Внутренние пользователи
+Person(ds, "Data Scientist", "Загружает модели, просматривает метрики")
+Person(mle, "ML Engineer", "Настраивает конвейеры, monitoring")
+Person(admin, "Администратор платформы", "Управляет доступом, квотами")
+
+' Потребитель приложений
+Person(app_dev, "Разработчик приложений", "Интегрирует предсказания")
+
+' Система
+System(platform, "Enterprise ML Platform", "Развёртывание, управление и обслуживание ML-моделей в production")
+
+' Внешние системы
+System_Ext(sso, "SSO Provider", "Аутентификация OAuth 2.0 / OIDC")
+System_Ext(storage, "Объектное хранилище", "S3/MinIO для артефактов моделей")
+System_Ext(k8s, "Kubernetes", "Оркестрация контейнеров")
+System_Ext(monitoring, "Стек monitoring", "Prometheus, Grafana")
+System_Ext(cicd, "CI/CD конвейер", "GitLab, Jenkins")
+
+' Связи - Пользователи
+Rel(ds, platform, "Загрузка моделей, развёртывание, monitoring")
+Rel(mle, platform, "Настройка, автоматизация, устранение неполадок")
+Rel(admin, platform, "Управление пользователями, квотами")
+Rel(app_dev, platform, "Inference API", "REST/gRPC")
+
+' Связи - Внешние системы
+Rel(platform, sso, "Аутентификация пользователей", "OAuth 2.0")
+Rel(platform, storage, "Хранение артефактов", "S3 API")
+Rel(platform, k8s, "Развёртывание моделей", "K8s API")
+Rel(platform, monitoring, "Экспорт метрик", "Prometheus")
+Rel(cicd, platform, "Триггер развёртываний", "Webhook")
+
+@enduml

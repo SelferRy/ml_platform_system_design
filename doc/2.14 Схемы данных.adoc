@@ -1,45 +1,4 @@
-= Enterprise ML Platform: Модель данных
-:toc: left
-:toclevels: 3
-:icons: font
-
-== 1. Обзор архитектуры данных
-
-=== 1.1 Стратегия хранения
-
-[cols="2,2,2,3"]
-|===
-| Тип данных | Хранилище | Технология | Обоснование
-
-| Метаданные моделей
-| Реляционное
-| PostgreSQL
-| ACID-транзакции, сложные запросы, ссылочная целостность
-
-| Артефакты моделей
-| Объектное хранилище
-| S3 / MinIO
-| Большие бинарные файлы, версионирование, высокая надёжность
-
-| Кэш предсказаний
-| Key-Value
-| Redis
-| Низкая латентность, поддержка TTL, скорость in-memory
-
-| События / Аудит
-| Log / Stream
-| Kafka → PostgreSQL
-| Event sourcing, возможность replay, развязка
-
-| Метрики
-| Time-Series
-| Prometheus / VictoriaMetrics
-| Оптимизация для time-series запросов, агрегации
-|===
-
-== 2. Определения сущностей
-
-=== 2.1 Основные сущности
+=== Схемы данных
 
 ==== Model
 
@@ -130,6 +89,48 @@ CREATE TABLE users (
 );
 ----
 
+==== BatchJob
+
+[source,sql]
+----
+CREATE TABLE batch_jobs (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id       UUID NOT NULL REFERENCES tenants(id),
+    model_version_id UUID NOT NULL REFERENCES model_versions(id),
+    status          VARCHAR(20) NOT NULL DEFAULT 'submitted',
+
+    -- Input/Output: BYOB или Managed
+    input_mode      VARCHAR(20) NOT NULL,  -- 'byob' или 'managed'
+    input_uri       VARCHAR(500) NOT NULL,  -- s3://...
+    output_uri      VARCHAR(500),
+
+    -- Progress tracking
+    total_records   BIGINT,
+    processed_records BIGINT DEFAULT 0,
+    failed_records  BIGINT DEFAULT 0,
+
+    -- Timing
+    created_at      TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    started_at      TIMESTAMP WITH TIME ZONE,
+    completed_at    TIMESTAMP WITH TIME ZONE,
+
+    -- Error handling
+    error_message   TEXT,
+    retry_count     INTEGER DEFAULT 0,
+
+    created_by      UUID NOT NULL REFERENCES users(id),
+
+    CONSTRAINT valid_status CHECK (status IN (
+        'submitted', 'queued', 'running', 'completed', 'failed', 'cancelled'
+    )),
+    CONSTRAINT valid_input_mode CHECK (input_mode IN ('byob', 'managed'))
+);
+
+CREATE INDEX idx_batch_jobs_tenant ON batch_jobs(tenant_id);
+CREATE INDEX idx_batch_jobs_status ON batch_jobs(status);
+CREATE INDEX idx_batch_jobs_created ON batch_jobs(created_at);
+----
+
 ==== AuditLog
 
 [source,sql]
@@ -152,8 +153,6 @@ CREATE TABLE audit_logs (
 CREATE INDEX idx_audit_logs_resource ON audit_logs(resource_type, resource_id);
 CREATE INDEX idx_audit_logs_user ON audit_logs(user_id);
 ----
-
-=== 2.2 Вспомогательные сущности
 
 ==== APIKey
 
@@ -201,77 +200,9 @@ CREATE INDEX idx_inference_logs_model ON inference_logs(model_id, timestamp);
 CREATE INDEX idx_inference_logs_deployment ON inference_logs(deployment_id, timestamp);
 ----
 
-== 3. Связи между сущностями
+==== Границы транзакций
 
-=== 3.1 Сводка связей
-
-[cols="2,1,2,2"]
-|===
-| Сущность 1 | Связь | Сущность 2 | Описание
-
-| Model
-| 1:N
-| ModelVersion
-| Модель имеет несколько версий
-
-| ModelVersion
-| 1:N
-| Deployment
-| Версия может иметь несколько развёртываний (canary)
-
-| User
-| 1:N
-| Model
-| Пользователь владеет моделями
-
-| User
-| 1:N
-| APIKey
-| Пользователь имеет API-ключи
-
-| User
-| 1:N
-| AuditLog
-| Действия пользователя логируются
-
-| Deployment
-| 1:N
-| InferenceLog
-| Развёртывание обслуживает запросы
-|===
-
-== 4. Требования консистентности
-
-=== 4.1 Уровни консистентности по компонентам
-
-[cols="2,2,3"]
-|===
-| Компонент | Консистентность | Обоснование
-
-| Model Registry (PostgreSQL)
-| Строгая
-| Изменения состояния модели должны быть немедленно видны; ACID требуется для переходов жизненного цикла
-
-| Кэш предсказаний (Redis)
-| Eventual
-| Устаревшие предсказания допустимы при коротком TTL; производительность важнее консистентности
-
-| Аудит-лог
-| Eventual
-| Асинхронная запись через Kafka допустима; логи могут иметь небольшую задержку
-
-| Метрики (Prometheus)
-| Eventual
-| Time-series данные по своей природе eventual; задержка ~10s допустима
-
-| Состояние развёртывания
-| Строгая
-| Состояние K8s должно соответствовать реестру; транзакции для изменений состояния
-|===
-
-=== 4.2 Границы транзакций
-
-==== Переход состояния модели
+===== Переход состояния модели
 
 [source,sql]
 ----
@@ -292,7 +223,7 @@ BEGIN;
 COMMIT;
 ----
 
-==== Создание развёртывания
+===== Создание развёртывания
 
 [source,sql]
 ----
@@ -309,116 +240,3 @@ BEGIN;
 COMMIT;
 -- Затем: асинхронное развёртывание K8s через событие
 ----
-
-== 5. Политики хранения данных
-
-[cols="2,2,2,2"]
-|===
-| Тип данных | Горячее хранение | Холодное хранение | Архив
-
-| Артефакты моделей
-| Бессрочно (пока активна)
-| 90 дней после deprecation
-| 1 год (S3 Glacier)
-
-| Логи инференса
-| 7 дней
-| 30 дней (агрегированные)
-| 1 год (комплаенс)
-
-| Аудит-логи
-| 30 дней
-| 1 год
-| 7 лет (комплаенс)
-
-| Метрики
-| 15 дней (сырые)
-| 1 год (downsampled)
-| Н/Д
-|===
-
-== 6. Диаграмма потоков данных
-
-image::diagrams/data-flow.png[Data Flow Diagram, width=800]
-
-_Исходник: link:diagrams/sources/data-flow.puml[data-flow.puml]_
-
-=== 6.1 Пути записи
-
-[cols="2,4"]
-|===
-| Операция | Путь
-
-| Загрузка модели
-| Клиент → API Gateway → Model Service → PostgreSQL + S3
-
-| Создание развёртывания
-| Model Service → PostgreSQL → Kafka → Deployment Service → K8s
-
-| Логирование инференса
-| Inference Service → Kafka → Log Processor → PostgreSQL (партиционированный)
-|===
-
-=== 6.2 Пути чтения
-
-[cols="2,4"]
-|===
-| Операция | Путь
-
-| Получение метаданных модели
-| Клиент → API Gateway → Model Service → PostgreSQL
-
-| Выполнение инференса
-| Клиент → API Gateway → Redis (кэш) → Inference Service → GPU
-
-| Просмотр метрик
-| Клиент → Grafana → Prometheus / VictoriaMetrics
-|===
-
-== 7. Оценки размеров
-
-=== 7.1 Требования к хранению
-
-[cols="2,2,2"]
-|===
-| Компонент | Оценочный размер | Расчёт
-
-| Артефакты моделей (S3)
-| 1 TB
-| 100 моделей × 10GB в среднем
-
-| Метаданные PostgreSQL
-| 10 GB
-| Модели + версии + развёртывания + аудит
-
-| Кэш Redis
-| 8 GB
-| 1M кэшированных предсказаний × 8KB в среднем
-
-| Метрики Prometheus
-| 50 GB / месяц
-| 100 моделей × 10 метрик × scrape 15s
-|===
-
-=== 7.2 Оценки пропускной способности
-
-[cols="2,2,2"]
-|===
-| Операция | Частота | Расчёт
-
-| Запросы инференса
-| 10 000 RPS
-| Целевая пиковая пропускная способность платформы
-
-| Чтение реестра моделей
-| 100 RPS
-| Загрузка моделей, запросы UI
-
-| Запись в реестр моделей
-| 10 RPS
-| Развёртывания, изменения состояний
-
-| Запись аудит-логов
-| 50 RPS
-| Все изменения состояний + действия пользователей
-|===

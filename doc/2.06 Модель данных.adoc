@@ -1,0 +1,152 @@
+=== Модель данных
+
+==== Основные сущности
+
+===== Model
+
+Корневая сущность реестра. Представляет ML-модель как логическую единицу.
+
+* `id` (UUID) — уникальный идентификатор
+* `name` (VARCHAR 255, UNIQUE) — человекочитаемое имя модели
+* `description` (TEXT) — описание назначения модели
+* `owner_id` (UUID, FK → users) — владелец модели
+* `created_at`, `updated_at` (TIMESTAMPTZ) — временные метки
+
+===== ModelVersion
+
+Конкретная версия модели с артефактом и метаданными. Каждая версия проходит жизненный цикл: draft → validating → staging → production → deprecated.
+
+* `id` (UUID) — уникальный идентификатор версии
+* `model_id` (UUID, FK → models) — ссылка на модель
+* `version` (VARCHAR 50) — semver: 1.0.0
+* `state` (VARCHAR 20) — состояние жизненного цикла: `draft`, `validating`, `staging`, `production`, `deprecated`, `failed`
+* `artifact_uri` (VARCHAR 500) — путь к артефакту в S3
+* `artifact_hash` (VARCHAR 64) — SHA-256 хеш артефакта для верификации
+* `framework` (VARCHAR 50) — фреймворк: pytorch, onnx, tensorflow
+* `input_schema`, `output_schema` (JSONB) — JSON-схемы входных/выходных данных
+* `metadata` (JSONB) — произвольные key-value метаданные
+* `created_at` (TIMESTAMPTZ), `created_by` (UUID, FK → users)
+
+===== Deployment
+
+Развёртывание версии модели в Kubernetes. Поддерживает canary-развёртывания через `traffic_percent`.
+
+* `id` (UUID) — уникальный идентификатор
+* `model_version_id` (UUID, FK → model_versions) — версия модели
+* `status` (VARCHAR 20) — состояние: `pending`, `deploying`, `running`, `failed`, `terminated`
+* `endpoint_url` (VARCHAR 500) — URL эндпоинта
+* `replicas`, `min_replicas`, `max_replicas` (INTEGER) — параметры масштабирования
+* `traffic_percent` (INTEGER) — процент трафика для canary
+* `config` (JSONB) — лимиты ресурсов, env vars
+* `created_at`, `updated_at` (TIMESTAMPTZ), `created_by` (UUID, FK → users)
+
+===== User
+
+Пользователь платформы, аутентифицируемый через SSO.
+
+* `id` (UUID) — уникальный идентификатор
+* `external_id` (VARCHAR 255, UNIQUE) — идентификатор из SSO
+* `email` (VARCHAR 255) — email
+* `name` (VARCHAR 255) — имя
+* `role` (VARCHAR 50) — роль: `viewer`, `developer`, `admin`
+* `created_at`, `last_login_at` (TIMESTAMPTZ)
+
+===== BatchJob
+
+Задание на batch inference. Поддерживает два режима хранения: BYOB (клиентский bucket) и Managed (платформенный storage).
+
+* `id` (UUID) — уникальный идентификатор
+* `tenant_id` (UUID, FK → tenants) — тенант-владелец
+* `model_version_id` (UUID, FK → model_versions) — используемая версия модели
+* `status` (VARCHAR 20) — состояние: `submitted`, `queued`, `running`, `completed`, `failed`, `cancelled`
+* `input_mode` (VARCHAR 20) — режим: `byob` или `managed`
+* `input_uri`, `output_uri` (VARCHAR 500) — пути S3 для входных/выходных данных
+* `total_records`, `processed_records`, `failed_records` (BIGINT) — прогресс обработки
+* `created_at`, `started_at`, `completed_at` (TIMESTAMPTZ) — временные метки
+* `error_message` (TEXT), `retry_count` (INTEGER) — обработка ошибок
+* `created_by` (UUID, FK → users)
+
+==== Вспомогательные сущности
+
+===== APIKey
+
+API-ключ для программного доступа к платформе. Хранится хеш ключа (SHA-256), не сам ключ.
+
+* `id` (UUID) — уникальный идентификатор
+* `user_id` (UUID, FK → users) — владелец ключа
+* `key_hash` (VARCHAR 64, UNIQUE) — SHA-256 хеш
+* `name` (VARCHAR 100) — человекочитаемое имя
+* `scopes` (TEXT[]) — набор прав: `inference:read`, `models:write` и т.д.
+* `expires_at`, `last_used_at`, `created_at`, `revoked_at` (TIMESTAMPTZ)
+
+===== AuditLog
+
+Журнал аудита действий пользователей. Партиционирован по месяцам для эффективного retention.
+
+* `id` (UUID) — уникальный идентификатор
+* `timestamp` (TIMESTAMPTZ) — время события
+* `user_id` (UUID, FK → users) — инициатор действия
+* `action` (VARCHAR 100) — тип действия
+* `resource_type` (VARCHAR 50), `resource_id` (UUID) — целевой ресурс
+* `old_state`, `new_state`, `metadata` (JSONB) — детали изменения
+
+===== InferenceLog
+
+Лог запросов инференса. Партиционирован по месяцам. Используется для мониторинга, отладки и детекции дрифта.
+
+* `id` (UUID) — уникальный идентификатор
+* `timestamp` (TIMESTAMPTZ) — время запроса
+* `model_id` (UUID), `model_version` (VARCHAR 50), `deployment_id` (UUID) — контекст
+* `request_id` (VARCHAR 100) — идентификатор запроса для трейсинга
+* `latency_ms` (INTEGER) — латентность в миллисекундах
+* `status_code` (INTEGER) — HTTP статус ответа
+* `input_hash` (VARCHAR 64) — хеш входных данных для детекции дрифта
+* `cached` (BOOLEAN) — был ли результат из кэша
+* `user_id` (UUID), `metadata` (JSONB)
+
+==== Связи между сущностями
+
+[cols="2,1,2,2"]
+|===
+| Сущность 1 | Связь | Сущность 2 | Описание
+
+| Model
+| 1:N
+| ModelVersion
+| Модель имеет несколько версий
+
+| ModelVersion
+| 1:N
+| Deployment
+| Версия может иметь несколько развёртываний (canary)
+
+| User
+| 1:N
+| Model
+| Пользователь владеет моделями
+
+| User
+| 1:N
+| APIKey
+| Пользователь имеет API-ключи
+
+| User
+| 1:N
+| AuditLog
+| Действия пользователя логируются
+
+| Deployment
+| 1:N
+| InferenceLog
+| Развёртывание обслуживает запросы
+
+| Tenant
+| 1:N
+| BatchJob
+| Тенант запускает batch jobs
+
+| ModelVersion
+| 1:N
+| BatchJob
+| Версия модели используется в batch jobs
+|===

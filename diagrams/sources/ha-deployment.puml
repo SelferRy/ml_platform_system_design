@@ -1,0 +1,80 @@
+@startuml ha-deployment
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Deployment.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Схема HA-развёртывания — Enterprise ML Platform (Baseline/Alpha)
+
+Deployment_Node(region, "AWS us-east-1", "Primary Region") {
+
+    Deployment_Node(az_a, "AZ-A (us-east-1a)", "Availability Zone") {
+        Deployment_Node(k8s_a, "Kubernetes Node Group A") {
+            Container(gw_a, "API Gateway", "Kong/Envoy", "Под: 2 реплики min")
+            Container(inf_a, "Inference Service", "Triton", "Под: 4 реплики min")
+            Container(model_a, "Model Service", "FastAPI", "Под: 2 реплики min")
+            Container(deploy_a, "Deployment Service", "Go/Temporal", "Под: 2 реплики min")
+        }
+        Deployment_Node(db_a, "Data Layer A") {
+            ContainerDb(pg_primary, "PostgreSQL Primary", "RDS Multi-AZ", "Запись. gp3: 3000 IOPS")
+            ContainerDb(redis_a, "Redis Primary", "ElastiCache", "Основной: 16GB RAM")
+        }
+    }
+
+    Deployment_Node(az_b, "AZ-B (us-east-1b)", "Availability Zone") {
+        Deployment_Node(k8s_b, "Kubernetes Node Group B") {
+            Container(gw_b, "API Gateway", "Kong/Envoy", "Под: 2 реплики min")
+            Container(inf_b, "Inference Service", "Triton", "Под: 4 реплики min")
+            Container(model_b, "Model Service", "FastAPI", "Под: 2 реплики min")
+        }
+        Deployment_Node(db_b, "Data Layer B") {
+            ContainerDb(pg_replica1, "PostgreSQL Replica-1", "RDS Read Replica", "Чтение. Синхронная репликация")
+            ContainerDb(redis_b, "Redis Replica", "ElastiCache", "Реплика: автофейловер")
+        }
+    }
+
+    Deployment_Node(az_c, "AZ-C (us-east-1c)", "Availability Zone") {
+        Deployment_Node(k8s_c, "Kubernetes Node Group C (GPU)") {
+            Container(inf_c, "Inference Service", "Triton+GPU", "Под: 2 реплики min (GPU)")
+            Container(batch_c, "Batch Workers", "Python", "HPA: min=2, max=20")
+        }
+        Deployment_Node(db_c, "Data Layer C") {
+            ContainerDb(pg_replica2, "PostgreSQL Replica-2", "RDS Read Replica", "Чтение. Резерв")
+        }
+    }
+
+    Deployment_Node(shared, "Shared Services (Multi-AZ)") {
+        ContainerQueue(kafka, "Apache Kafka", "MSK / Self-managed", "3 брокера, RF=3, min.ISR=2")
+        ContainerDb(s3, "S3 / MinIO", "Object Storage", "11×9 durability, 3 копии")
+        Container(prometheus, "Prometheus", "Prometheus HA", "2 инстанса + Thanos")
+        Container(grafana, "Grafana", "Grafana", "Дашборды. 2 реплики")
+        Container(alertmanager, "Alertmanager", "Alertmanager", "2 реплики, дедупликация")
+    }
+
+    Deployment_Node(ingress, "Ingress Layer") {
+        Container(nlb, "Network LB", "AWS NLB", "L4: TCP. Anycast IP, health check /health")
+        Container(alb, "Application LB", "AWS ALB", "L7: HTTP/HTTPS, path-based routing")
+    }
+}
+
+Deployment_Node(dr_region, "AWS eu-west-1 (DR / Future)", "Disaster Recovery Region") {
+    Container(dr_note, "DR Region", "Passive", "Активируется при региональном сбое. RTO ≤5 мин (Critical)")
+}
+
+Rel(nlb, alb, "TCP → HTTP/HTTPS")
+Rel(alb, gw_a, "HTTPS", "AZ-A: 50% трафика")
+Rel(alb, gw_b, "HTTPS", "AZ-B: 50% трафика")
+Rel(gw_a, inf_a, "gRPC", "Inference")
+Rel(gw_b, inf_b, "gRPC", "Inference")
+Rel(inf_a, redis_a, "Redis protocol", "Cache R/W")
+Rel(inf_b, redis_b, "Redis protocol", "Cache R (replica)")
+Rel(redis_a, redis_b, "Replication", "Async")
+Rel(model_a, pg_primary, "SQL", "Write")
+Rel(model_b, pg_replica1, "SQL", "Read")
+Rel(inf_c, pg_replica2, "SQL", "Read (batch ctx)")
+Rel(pg_primary, pg_replica1, "WAL streaming", "Sync")
+Rel(pg_primary, pg_replica2, "WAL streaming", "Async")
+Rel(kafka, batch_c, "consume", "Batch jobs")
+Rel(inf_a, s3, "S3 API", "Model artifacts")
+Rel(inf_b, s3, "S3 API", "Model artifacts")
+
+@enduml

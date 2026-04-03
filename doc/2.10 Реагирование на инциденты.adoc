@@ -1,0 +1,543 @@
+=== Реагирование на инциденты и DR
+
+==== Модель инцидентов
+
+Инцидент — любое незапланированное событие, нарушающее или угрожающее нарушением SLO. Модель следует Google SRE: инцидент открывается при потенциальном нарушении SLO, не только после факта.
+
+===== Жизненный цикл инцидента
+
+[source]
+----
+Обнаружение (алерт / жалоба клиента)
+    → Триаж (определить приоритет P0–P3, ≤5 мин)
+    → Миtigация (восстановить сервис, ≤RTO)
+    → Расследование (root cause)
+    → Postmortem (без обвинений, за 48 часов)
+    → Preventive actions (тикеты в backlog)
+----
+
+===== Матрица приоритетов инцидентов
+
+[cols="1,2,2,2,2"]
+|===
+| Приоритет | Критерий | RTO | Ответственный | Коммуникация
+
+| P0 — Critical
+| Inference API недоступен; SLO availability < 99% за 5 мин; Потеря данных
+| ≤5 мин
+| On-call engineer + Lead SRE
+| Немедленно: клиенты (status page) + Management
+
+| P1 — High
+| Error rate >1%; p99 >200ms sustained; PostgreSQL primary down; Kafka недоступен
+| ≤15 мин
+| On-call engineer
+| В течение 15 мин: мессенджер команды #incidents
+
+| P2 — Medium
+| Batch jobs задерживаются >30%; Cache hit rate <50%; Один worker down
+| ≤1 час
+| Дежурный team member
+| В течение 1 часа: мессенджер команды #ml-platform-alerts
+
+| P3 — Low
+| Деградация нон-критичных функций; Disk 80%+; Один pod CrashLoop
+| ≤4 часа
+| Следующий рабочий день
+| Ticket
+|===
+
+==== Runbooks
+
+===== Runbook: Inference Service недоступен (P0)
+
+*Симптом*: Алерт `InferenceServiceDown`. Клиенты получают 503. SLO breach.
+
+*Шаги:*
+
+[source,bash]
+----
+# 1. Проверить статус подов
+kubectl get pods -n ml-platform -l app=inference-service
+
+# 2. Проверить события K8s (OOMKill, CrashLoop, ImagePullError)
+kubectl describe pods -n ml-platform -l app=inference-service
+
+# 3. Проверить логи последних 100 строк
+kubectl logs -n ml-platform -l app=inference-service --tail=100
+
+# 4. Если OOMKill — временно увеличить memory limit
+kubectl set resources deployment inference-service \
+  --limits=memory=8Gi -n ml-platform
+
+# 5. Если CrashLoop — проверить readiness probe
+kubectl rollout history deployment/inference-service -n ml-platform
+
+# 6. Если нужен откат к предыдущей версии
+kubectl rollout undo deployment/inference-service -n ml-platform
+
+# 7. Проверить, что реплики поднялись
+kubectl rollout status deployment/inference-service -n ml-platform
+----
+
+*Критерий восстановления*: `kube_deployment_status_replicas_available >= min_replicas` AND `error_rate < 0.1%` за 2 мин.
+
+*Эскалация*: Если не восстановлено за 5 мин → звонок Lead SRE.
+
+---
+
+===== Runbook: Высокая латентность инференса (P1)
+
+*Симптом*: Алерт `InferenceLatencyP99High`. p99 > 200ms.
+
+*Диагностика:*
+
+[source,bash]
+----
+# 1. Проверить GPU utilization
+kubectl exec -it <inference-pod> -n ml-platform -- nvidia-smi
+
+# 2. Проверить RPS текущий vs capacity
+# Grafana: mlp_inference_requests_total rate / pod_count
+
+# 3. Проверить cache hit rate
+# Grafana: mlp_inference_cache_hits_total / (hits + misses)
+
+# 4. Проверить, запущен ли auto-scaling
+kubectl get hpa -n ml-platform
+
+# 5. Если HPA не сработал — ручной scale-out
+kubectl scale deployment inference-service --replicas=15 -n ml-platform
+
+# 6. Проверить, нет ли noisy neighbor (один тенант забивает GPU)
+# Grafana: mlp_inference_requests_total by tenant_id
+
+# 7. Если noisy neighbor — применить rate limit emergency
+kubectl annotate ingress ml-platform-ingress \
+  nginx.ingress.kubernetes.io/limit-rps="500" -n ml-platform
+----
+
+*Критерий восстановления*: p99 < 100ms за 5 мин.
+
+---
+
+===== Runbook: PostgreSQL Primary недоступен (P1)
+
+*Симптом*: Алерт `PostgreSQLPrimaryDown`. Model Service и Deployment Service не могут писать.
+
+[source,bash]
+----
+# 1. Проверить статус RDS инстанса
+aws rds describe-db-instances --db-instance-identifier ml-platform-pg-primary
+
+# 2. RDS Multi-AZ — автоматический failover (обычно ≤60 сек)
+# Проверить статус failover
+aws rds describe-events --source-identifier ml-platform-pg-primary \
+  --duration 60
+
+# 3. Проверить, что pgBouncer переключился на новый endpoint
+# DNS endpoint RDS обновляется автоматически при failover
+
+# 4. Проверить приложения — ожидают ли они reconnect
+kubectl rollout restart deployment/model-service -n ml-platform
+kubectl rollout restart deployment/deployment-service -n ml-platform
+
+# 5. Убедиться в репликации: новый primary должен принять writes
+psql $DATABASE_URL -c "SELECT pg_is_in_recovery();"
+# Ожидаемый ответ: f (false = primary)
+----
+
+*Критерий восстановления*: Все сервисы пишут в БД без ошибок. Lag на репликах < 50 MB.
+
+---
+
+===== Runbook: Kafka недоступен (P1)
+
+*Симптом*: Сервисы не могут публиковать события. Batch jobs не запускаются.
+
+[source,bash]
+----
+# 1. Проверить статус брокеров Kafka
+kubectl get pods -n kafka -l app=kafka
+
+# 2. Проверить число ISR (In-Sync Replicas) — min.ISR=2
+kubectl exec -it kafka-0 -n kafka -- kafka-topics.sh \
+  --describe --bootstrap-server kafka:9092 --topic inference-events
+
+# 3. Если один брокер упал — Kafka продолжает работу (RF=3, min.ISR=2)
+# Просто подождать авто-election нового лидера (~30 сек)
+
+# 4. Если два брокера упали — критический сценарий
+# Принудительный unclean leader election (РИСК: потеря данных)
+# ТОЛЬКО с одобрения Lead SRE
+kubectl exec -it kafka-0 -n kafka -- kafka-configs.sh \
+  --alter --entity-type brokers --entity-default \
+  --add-config unclean.leader.election.enable=true \
+  --bootstrap-server kafka:9092
+
+# 5. После восстановления — отключить unclean election
+----
+
+---
+
+===== Runbook: Batch Job завис (P2)
+
+*Симптом*: Batch job в статусе `running` >2 часа при объёме <1M записей (нарушение NFR-108).
+
+[source,bash]
+----
+# 1. Проверить прогресс job
+psql $DATABASE_URL -c "
+  SELECT id, status, total_records, processed_records,
+         started_at, NOW() - started_at as duration
+  FROM batch_jobs WHERE status = 'running';"
+
+# 2. Проверить логи worker-а
+kubectl logs -n ml-platform -l job-id=<JOB_ID> --tail=200
+
+# 3. Проверить Kafka consumer lag для job
+kubectl exec -it kafka-0 -n kafka -- kafka-consumer-groups.sh \
+  --describe --group batch-worker-group \
+  --bootstrap-server kafka:9092
+
+# 4. Если worker завис — убить и перезапустить (retry до 3 раз, NFR-208)
+kubectl delete pod <worker-pod> -n ml-platform
+# K8s автоматически создаст новый pod, job перезапустится
+
+# 5. Если retry исчерпаны — переместить в DLQ
+psql $DATABASE_URL -c "
+  UPDATE batch_jobs SET status = 'failed',
+  error_message = 'max retries exceeded'
+  WHERE id = '<JOB_ID>';"
+----
+
+==== Стратегия масштабирования и HA
+
+===== Auto-scaling политики
+
+Масштабирование реализовано через Kubernetes HPA (Horizontal Pod Autoscaler) и KEDA для event-driven scaling.
+
+[cols="2,2,2,2,2"]
+|===
+| Компонент | Min реплики | Max реплики | Триггер scale-out | Триггер scale-in
+
+| API Gateway
+| 2 (per AZ)
+| 10
+| CPU > 70% или RPS > 800/pod
+| CPU < 30% за 5 мин
+
+| Inference Service
+| 3 (across AZs)
+| 20
+| GPU util > 70% или RPS > 800/pod
+| RPS < 200/pod за 10 мин
+
+| Model Service
+| 2
+| 8
+| CPU > 70%
+| CPU < 30% за 10 мин
+
+| Deployment Service
+| 2
+| 4
+| Queue depth > 10 pending deploys
+| Queue depth == 0 за 10 мин
+
+| Batch Workers
+| 2
+| 20
+| Kafka lag > 20 задач (KEDA)
+| Kafka lag == 0 за 5 мин
+
+| Batch Workers (GPU)
+| 1
+| 5
+| GPU util > 60% или >2 GPU jobs pending
+| GPU jobs == 0 за 15 мин
+|===
+
+NOTE: Время реакции автомасштабирования ≤2 мин (NFR-304). HPA настроен с `scaleUpStabilizationWindowSeconds: 60` и `scaleDownStabilizationWindowSeconds: 300` для предотвращения флаппинга.
+
+===== Scale-to-zero
+
+Для неактивных моделей применяется KEDA `ScaledObject`:
+
+[source,yaml]
+----
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: inference-scaler
+spec:
+  scaleTargetRef:
+    name: inference-service
+  minReplicaCount: 0  # scale-to-zero при 0 запросов
+  maxReplicaCount: 20
+  cooldownPeriod: 1800  # 30 мин без запросов → scale to 0 (NFR-306)
+  triggers:
+  - type: prometheus
+    metadata:
+      serverAddress: http://prometheus:9090
+      metricName: mlp_inference_requests_total
+      threshold: "1"
+      query: |
+        sum(rate(mlp_inference_requests_total[5m])) > 0
+----
+
+===== Вертикальное масштабирование (когда горизонтальное не помогает)
+
+[cols="2,3,2"]
+|===
+| Компонент | Условие для вертикального scale | Действие
+
+| PostgreSQL
+| IOPS > 5 000 IOPS sustained (базовый gp3 = 3 000)
+| Upgrade до gp3 с provisioned 8 000 IOPS или migrate на io2
+
+| Redis
+| Memory usage > 85% (>13.6 GB из 16 GB)
+| Upgrade инстанса: 16 GB → 32 GB
+
+| Batch Worker (Heavy)
+| Job duration >2× NFR-108
+| Upgrade CPU/GPU ресурсов пода
+
+| Inference Pod (GPU)
+| OOMKill при инференсе
+| Увеличить memory limit: 8 GB → 16 GB
+|===
+
+==== Disaster Recovery Plan
+
+===== Классы критичности и RTO/RPO
+
+Классы определены в NFR (1.02):
+
+[cols="1,2,2,2,2"]
+|===
+| Класс | RTO | RPO | Компоненты | DR стратегия
+
+| Critical
+| ≤5 мин
+| 0 (zero data loss)
+| Inference API, API Gateway
+| Multi-AZ active-active; автоматический failover NLB
+
+| High
+| ≤15 мин
+| ≤1 мин
+| Model Registry, PostgreSQL, Deployment Service
+| RDS Multi-AZ; автоматический failover; Redis Sentinel
+
+| Medium
+| ≤1 час
+| ≤15 мин
+| Batch Inference, Monitoring
+| Single-AZ + hot standby; ручной failover
+
+| Low
+| ≤4 часа
+| ≤1 час
+| Аудит-логи, дашборды, отчёты
+| S3 cross-region replication; RTO through restore
+|===
+
+===== Сценарий 1: Отказ одной AZ
+
+*Вероятность*: Средняя (один раз в год для AWS us-east-1)
+
+*Автоматическая реакция*:
+
+1. NLB health check обнаруживает недоступность подов в AZ-A за 10s
+2. NLB прекращает маршрутизировать трафик в AZ-A
+3. 100% трафика переходит на AZ-B и AZ-C
+4. RDS Multi-AZ автоматически продвигает реплику в другой AZ (≤60s)
+5. Inference Service в AZ-B/C принимает 100% нагрузки
+
+*Ожидаемый RTO*: < 2 мин. RPO: 0 (Multi-AZ синхронная репликация PostgreSQL).
+
+*Ручные действия не требуются.*
+
+---
+
+===== Сценарий 2: Отказ региона (Regional DR)
+
+*Вероятность*: Низкая
+
+*Статус в Baseline/Alpha*: DR-регион (eu-west-1) находится в режиме "passive warm standby". Полная автоматизация failover запланирована в MVP фазе.
+
+*Ручная процедура failover (RTO ≤5 мин для Critical):*
+
+[source,bash]
+----
+# 1. Подтвердить региональный сбой (2 независимых источника)
+# AWS Health Dashboard + внутренние мониторинги
+
+# 2. Переключить DNS на DR-регион
+aws route53 change-resource-record-sets \
+  --hosted-zone-id <HZ_ID> \
+  --change-batch file://dr-failover-us-to-eu.json
+
+# 3. Убедиться, что последний S3 cross-region snapshot загружен
+aws s3 ls s3://ml-platform-dr-eu/postgresql-backup/ \
+  --recursive | sort | tail -5
+
+# 4. Восстановить PostgreSQL из snapshot в eu-west-1
+aws rds restore-db-instance-from-db-snapshot \
+  --db-instance-identifier ml-platform-pg-eu \
+  --db-snapshot-identifier <LATEST_SNAPSHOT>
+
+# 5. Запустить Helm release в eu-west-1
+helm upgrade --install ml-platform ./helm/ml-platform \
+  --namespace ml-platform \
+  --values ./helm/values-eu-west-1.yaml
+
+# 6. Smoke test
+curl -f https://api-eu.ml-platform.example/health
+----
+
+*Бэкап данных для DR*:
+
+[cols="2,2,2,2"]
+|===
+| Данные | Метод бэкапа | Частота | Хранение
+
+| PostgreSQL metadata
+| RDS automated backup + manual snapshot
+| Ежечасный инкрементальный + ежедневный полный (NFR-503)
+| 30 дней в primary + cross-region copy в DR
+
+| S3 model artifacts
+| S3 Cross-Region Replication
+| Continuous (реплицируется при записи)
+| Синхронно в DR bucket
+
+| Kafka topics
+| MirrorMaker 2 (если MSK)
+| Continuous async replication
+| DR регион (lag < 1 мин)
+
+| Redis cache
+| Не резервируется (volatile data)
+| —
+| Восстанавливается через прогрев кэша
+|===
+
+---
+
+===== Сценарий 3: Повреждение данных (Data Corruption)
+
+*Вероятность*: Низкая; влияние: Критическое
+
+*Процедура*:
+
+[source,bash]
+----
+# 1. НЕМЕДЛЕННО переключить PostgreSQL в read-only для предотвращения
+#    распространения повреждений
+psql $DATABASE_URL -c "ALTER SYSTEM SET default_transaction_read_only = on;"
+psql $DATABASE_URL -c "SELECT pg_reload_conf();"
+
+# 2. Определить moment of corruption через audit log
+psql $DATABASE_URL -c "
+  SELECT timestamp, action, user_id, resource_type, metadata
+  FROM audit_logs
+  WHERE timestamp > NOW() - INTERVAL '2 hours'
+  ORDER BY timestamp DESC LIMIT 100;"
+
+# 3. Point-in-Time Recovery (PITR) до момента перед corruption
+aws rds restore-db-instance-to-point-in-time \
+  --source-db-instance-identifier ml-platform-pg-primary \
+  --target-db-instance-identifier ml-platform-pg-pitr \
+  --restore-time 2025-04-04T10:30:00Z
+
+# 4. Сравнить данные, восстановить только повреждённые таблицы
+pg_dump -t models -t model_versions ml-platform-pg-pitr > restore.sql
+psql $DATABASE_URL < restore.sql
+
+# 5. Снять read-only режим
+psql $DATABASE_URL -c "ALTER SYSTEM RESET default_transaction_read_only;"
+psql $DATABASE_URL -c "SELECT pg_reload_conf();"
+----
+
+==== Chaos Engineering (проверка DR)
+
+Устойчивость системы проверяется через контролируемые эксперименты. В Baseline/Alpha — ручные учения; автоматизация (Chaos Mesh) — в MVP фазе.
+
+[cols="2,3,2,2"]
+|===
+| Сценарий | Ожидаемый результат | Частота | Инструмент
+
+| Kill один inference pod
+| HPA перезапускает pod <2 мин; клиенты не замечают (connection retry)
+| Еженедельно
+| kubectl delete pod
+
+| Kill один Kafka broker
+| Kafka продолжает работу (RF=3, min.ISR=2); lag возрастает, нормализуется за <5 мин
+| Ежемесячно
+| kubectl delete pod
+
+| Network partition AZ-A
+| NLB перенаправляет трафик; RDS failover; RTO <5 мин
+| Раз в квартал
+| AWS Fault Injection Simulator
+
+| PostgreSQL failover
+| RDS Multi-AZ promotion; Model Service reconnect; zero data loss
+| Раз в квартал
+| aws rds reboot --force-failover
+
+| Redis failover
+| Sentinel election нового primary; cache miss burst, нормализация за <1 мин
+| Ежемесячно
+| redis-cli DEBUG sleep 30
+|===
+
+NOTE: Все chaos-учения проводятся в staging-окружении перед запуском в production. В production — только после успешного staging-теста и в период низкого трафика (воскресенье 03:00–05:00 UTC).
+
+==== Postmortem процесс
+
+После каждого P0/P1 инцидента обязателен postmortem-документ:
+
+* *Срок*: в течение 48 часов после восстановления
+* *Принцип*: Blameless — анализ системных причин, не вина людей
+* *Структура*: Хронология → Root Cause → Impact → Действия по предотвращению (с тикетами)
+* *Хранение*: Wiki / Confluence — раздел "Postmortems"
+* *Review*: еженедельный SRE meeting — разбор action items
+
+===== Шаблон postmortem
+
+[cols="1,3"]
+|===
+| Поле | Содержание
+
+| Дата/время инцидента
+| UTC начало и конец
+
+| Приоритет
+| P0 / P1
+
+| Длительность
+| X минут / часов
+
+| Затронутые сервисы
+| Inference Service, batch jobs...
+
+| Клиентский impact
+| N% запросов failed; N batch jobs задержано
+
+| Root Cause
+| Одно предложение: «Сбой из-за X, который привёл к Y»
+
+| Timeline
+| Время → событие (алерт, action, восстановление)
+
+| Contributing factors
+| Что сделало сбой возможным или усилило его
+
+| Action items
+| ID тикета, Owner, Срок
+|===

@@ -22,3 +22,17 @@
 . (+) В модель данных добавлена сущность Tenant (id, name, plan, quota, region, status); tenant_id добавлен в Model, User, APIKey
 . (+) В схемы данных добавлен DDL таблицы tenants и tenant_id с FK и индексами в трёх таблицах
 . (+) В расчёты показателей добавлены: сетевая нагрузка inference и batch S3, PostgreSQL IOPS, обоснование числа инстансов со ссылками на NFR
+
+== ДЗ 2
+2025.04.04
+
+. (+) Определены узкие места и стратегия масштабирования (горизонтальное/вертикальное, обоснование по компонентам) — doc/2.07
+. (+) Добавлены пороги развития архитектуры: условия перехода к шардированию PG, multi-cluster, multi-region — doc/2.07
+. (+) Описан подход к фазам проектирования: Baseline с extension points, рассмотрены альтернативы — doc/2.08
+. (+) Детализирована схема архитектуры с HA: replica sets (min/max реплики, AZ-распределение), auto-scaling HPA конфигурация, LB health checks (readiness/liveness/startup probes), Circuit Breaker — doc/2.08
+. (+) Создана HA-диаграмма с трёхзонным развёртыванием — diagrams/ha-deployment.puml → PNG
+. (+) Создан раздел Observability: стек (Prometheus/VictoriaMetrics/Loki/Grafana/Alertmanager), метрики inference/batch/model/system, SLO с error budget, правила алертов P0–P3, capacity planning через метрики — doc/2.09
+. (+) Создана диаграмма observability стека — diagrams/observability.puml → PNG
+. (+) Создан раздел "Реагирование на инциденты": матрица приоритетов P0–P3, runbooks для 5 сценариев (inference down, высокая латентность, PostgreSQL failover, Kafka failure, batch job завис), DR-план для 3 сценариев (AZ failure, region failure, data corruption), chaos engineering план, postmortem процесс — doc/2.10
+. (+) Раскомментированы include для 2.09 и 2.10 в architecture-decision.adoc
+. (+) Каналы алертинга абстрагированы от конкретного мессенджера (Telegram/Slack/MS Teams — на выбор) — doc/2.09, doc/2.10, diagrams/observability.puml

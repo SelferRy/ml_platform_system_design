@@ -1,0 +1,7 @@
+=== Схема концептуальной архитектуры
+
+ifndef::imagesdir[:imagesdir: {docdir}/../diagrams]
+
+image::c4-context.png[C4 Context Diagram, width=800]
+
+_Исходник: link:diagrams/sources/c4-context.puml[c4-context.puml]_

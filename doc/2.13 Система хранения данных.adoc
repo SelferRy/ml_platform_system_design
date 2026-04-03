@@ -1,0 +1,156 @@
+=== Система хранения данных
+
+==== Стратегия хранения
+
+[cols="2,2,2,3"]
+|===
+| Тип данных | Хранилище | Технология | Обоснование
+
+| Метаданные моделей
+| Реляционное
+| PostgreSQL
+| ACID-транзакции, сложные запросы, ссылочная целостность
+
+| Артефакты моделей
+| Объектное хранилище
+| S3 / MinIO
+| Большие бинарные файлы, версионирование, высокая надёжность
+
+| Кэш предсказаний
+| Key-Value
+| Redis
+| Низкая латентность, поддержка TTL, скорость in-memory
+
+| События / Аудит
+| Log / Stream
+| Kafka → PostgreSQL
+| Event sourcing, возможность replay, развязка
+
+| Метрики
+| Time-Series
+| Prometheus / VictoriaMetrics
+| Оптимизация для time-series запросов, агрегации
+
+| Batch Inference Data
+| Объектное хранилище
+| S3 (клиента или платформы)
+| Hybrid: BYOB для enterprise, managed storage для self-service
+|===
+
+==== Организация S3 Buckets
+
+Платформа использует **Hybrid-подход** для batch inference data:
+
+* **BYOB (Bring Your Own Bucket)** — enterprise-клиенты указывают свои buckets
+* **Managed Storage** — платформа предоставляет storage для self-service клиентов
+
+===== Структура buckets платформы
+
+[cols="2,3,2,2"]
+|===
+| Bucket | Содержимое | Retention | Isolation
+
+| `ml-models-{region}`
+| Артефакты моделей (weights, configs)
+| До deprecation + 90 дней
+| Per-tenant prefix
+
+| `ml-batch-input-{region}`
+| Входные данные batch jobs (managed mode)
+| 7 дней после завершения job
+| Per-tenant prefix
+
+| `ml-batch-output-{region}`
+| Результаты batch jobs (managed mode)
+| 30 дней
+| Per-tenant prefix
+
+| `ml-logs-{region}`
+| Inference logs, audit exports
+| 30 дней hot → 1 год cold
+| Per-tenant prefix
+|===
+
+===== BYOB Mode (Enterprise)
+
+Клиент предоставляет:
+
+* `input_uri`: `s3://customer-bucket/input/data.csv`
+* `output_uri`: `s3://customer-bucket/output/`
+
+Платформа получает доступ через:
+
+* **AWS**: IAM Role assumption (cross-account)
+* **GCP**: Workload Identity Federation
+
+**Преимущества**: Data residency, GDPR compliance, клиент контролирует retention.
+
+===== Managed Mode (Self-service)
+
+Клиент загружает данные через API:
+
+[source]
+----
+POST /v1/batch/upload
+Content-Type: multipart/form-data
+
+Response: { "input_id": "inp_abc123", "uri": "s3://ml-batch-input-eu/tenant-42/inp_abc123" }
+----
+
+**Ограничения**: Max 10GB per file, storage quota per tenant.
+
+==== Требования консистентности
+
+===== Уровни консистентности по компонентам
+
+[cols="2,2,3"]
+|===
+| Компонент | Консистентность | Обоснование
+
+| Model Registry (PostgreSQL)
+| Строгая
+| Изменения состояния модели должны быть немедленно видны; ACID требуется для переходов жизненного цикла
+
+| Кэш предсказаний (Redis)
+| Eventual
+| Устаревшие предсказания допустимы при коротком TTL; производительность важнее консистентности
+
+| Аудит-лог
+| Eventual
+| Асинхронная запись через Kafka допустима; логи могут иметь небольшую задержку
+
+| Метрики (Prometheus)
+| Eventual
+| Time-series данные по своей природе eventual; задержка ~10s допустима
+
+| Состояние развёртывания
+| Строгая
+| Состояние K8s должно соответствовать реестру; транзакции для изменений состояния
+|===
+
+==== Политики хранения данных
+
+[cols="2,2,2,2"]
+|===
+| Тип данных | Горячее хранение | Холодное хранение | Архив
+
+| Артефакты моделей
+| Бессрочно (пока активна)
+| 90 дней после deprecation
+| 1 год (S3 Glacier)
+
+| Логи инференса
+| 7 дней
+| 30 дней (агрегированные)
+| 1 год (комплаенс)
+
+| Аудит-логи
+| 30 дней
+| 1 год
+| 7 лет (комплаенс)
+
+| Метрики
+| 15 дней (сырые)
+| 1 год (downsampled)
+| Н/Д
+|===

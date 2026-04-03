@@ -1,0 +1,59 @@
+=== Схема архитектуры решения
+
+ifndef::imagesdir[:imagesdir: {docdir}/../diagrams]
+
+image::c4-container.png[C4 Container Diagram, width=900]
+
+_Исходник: link:diagrams/sources/c4-container.puml[c4-container.puml]_
+
+==== Коммуникация компонентов
+
+[cols="2,2,2,2"]
+|===
+| Откуда | Куда | Протокол | Назначение
+
+| API Gateway
+| Model Service
+| REST/HTTP
+| Управление моделями
+
+| API Gateway
+| Inference Service
+| gRPC
+| Предсказания с низкой латентностью
+
+| Model Service
+| PostgreSQL
+| SQL
+| Хранение метаданных
+
+| Model Service
+| S3/MinIO
+| S3 API
+| Хранение артефактов
+
+| Model Service
+| Kafka
+| Kafka protocol
+| События (ModelCreated, StateChanged)
+
+| Inference Service
+| Redis
+| Redis protocol
+| Кэш предсказаний
+
+| Inference Service
+| GPU Pool
+| Triton protocol
+| Выполнение модели
+
+| Deployment Service
+| Kafka
+| Kafka protocol
+| События развёртывания
+
+| Deployment Service
+| Kubernetes API
+| HTTPS
+| Управление подами
+|===

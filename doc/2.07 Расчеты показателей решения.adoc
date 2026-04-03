@@ -1,5 +1,120 @@
 === Расчеты показателей решения
 
+Все расчёты опираются на целевые NFR. Ссылки на NFR приведены в каждом разделе.
+
+==== Узкие места и стратегия масштабирования
+
+===== Идентификация узких мест
+
+На основе анализа нагрузки (NFR-104, NFR-107) и топологии компонентов определены следующие потенциальные узкие места:
+
+[cols="1,3,2,3"]
+|===
+| Компонент | Потенциальный bottleneck | Метрика-индикатор | Стратегия митигации
+
+| GPU Pool
+| Нехватка GPU при пиковой нагрузке; очередь запросов растёт
+| GPU utilization >90%; inference p99 >200ms; `mlp_gpu_utilization_percent`
+| HPA по GPU utilization + reserved capacity; CPU fallback для лёгких моделей; scale-to-zero для неактивных (NFR-306)
+
+| Inference Service → Redis
+| Высокий cache miss rate при холодном старте или large model churn
+| `mlp_inference_cache_miss_rate` >50%
+| Pre-warming кэша при развёртывании; TTL тюнинг (default 60s для стабильных моделей)
+
+| PostgreSQL writes
+| Пик IOPS при большом sampling rate inference logs
+| IOPS >2 500 на gp3 базовом
+| Sampling rate ≤10% (уже в расчётах); партиционирование по месяцам; gp3 provision при росте
+
+| Kafka: inference-events топик
+| Накопление lag при burst write от 10K RPS инференса
+| `kafka_consumer_lag_sum` >10 000
+| RF=3, min.ISR=2; partitions=12 для параллелизма; log compaction для аудит топиков
+
+| S3 при batch
+| Конкурентные read/write от нескольких batch workers
+| S3 4XX throttling errors; throughput <5 MB/s per worker
+| Multi-part upload; retry с exponential backoff; S3 Transfer Acceleration для cross-region (Future)
+
+| API Gateway
+| Rate limit exhaustion при burst от одного тенанта (noisy neighbor)
+| `mlp_ratelimit_rejected_total` by tenant
+| Per-tenant rate limits (NFR-504, FR-504); burst allowance 2×normal rate для первых 30s
+|===
+
+===== Стратегия масштабирования
+
+Горизонтальное масштабирование является основным для stateless компонентов. Вертикальное — для stateful.
+
+[cols="2,2,3,2"]
+|===
+| Компонент | Тип масштабирования | Обоснование | Ограничение
+
+| API Gateway
+| Горизонтальное
+| Stateless; линейная зависимость RPS от числа реплик; дешевле вертикального
+| Shared state (rate limits) через Redis
+
+| Inference Service
+| Горизонтальное (CPU) + вертикальное (GPU memory)
+| CPU inference — stateless горизонтальное; GPU inference — ограничен GPU memory per pod, поэтому добавляем ноды с GPU
+| GPU доступность; K8s node provisioning lag (3–5 мин)
+
+| Model Service
+| Горизонтальное
+| Stateless (state в PostgreSQL); легко масштабируется
+| PostgreSQL connection pool (pgBouncer ограничивает)
+
+| PostgreSQL
+| Горизонтальное (read replicas) + вертикальное (primary)
+| Primary — вертикальное (ACID writes не масштабируются горизонтально); replicas — горизонтальное для read-heavy queries
+| Вертикальное ограничено инстанс-классами RDS
+
+| Kafka
+| Горизонтальное (брокеры + партиции)
+| Добавление партиций масштабирует throughput; добавление брокеров — хранение и replication
+| Нельзя уменьшить число партиций без перебалансировки
+
+| Batch Workers
+| Горизонтальное (event-driven)
+| KEDA по Kafka lag; полностью stateless; линейная зависимость throughput от числа workers (NFR-107)
+| GPU worker — ограничен GPU node availability
+|===
+
+===== Пороги развития архитектуры
+
+Текущая архитектура (single-region, 3 AZ, single PostgreSQL primary) рассчитана на фазу Baseline/Alpha: до 10 000 RPS инференса, 1 тенант, 1 регион. При росте нагрузки или требований к SLA наступают пороги, за которыми текущий дизайн перестаёт справляться без структурных изменений.
+
+Каждый порог описывает: измеримый сигнал, узкое место, архитектурное изменение. Пороги независимы — достижение одного не означает достижения остальных.
+
+[cols="1,2,2,3"]
+|===
+| Порог | Сигнал | Узкое место | Архитектурное изменение
+
+| >50 000 RPS инференса
+| `mlp_inference_requests_total` rate >50K; HPA достиг maxReplicas=20
+| Единый PostgreSQL primary не справляется с write-нагрузкой; API Gateway становится bottleneck
+| Горизонтальное шардирование PostgreSQL (по `tenant_id` или `model_id`); добавить CDN/edge cache перед API Gateway; пересмотреть maxReplicas Inference Service
+
+| >100 активных тенантов
+| Мониторинг tenant-квот; noisy neighbor incidents частотой >1/нед
+| Общий K8s namespace и shared resource pool приводят к конкурентному потреблению ресурсов
+| Переход к multi-cluster: выделенные namespace-pool или отдельные K8s-кластеры per tenant-tier (Premium/Standard); tenant-aware scheduling
+
+| >5 000 IOPS на PostgreSQL sustained
+| `postgresql_disk_io_utilization` >80%; `postgresql_replication_lag_bytes` >100 MB
+| gp3 базовый tier исчерпан; replica lag начинает влиять на read-запросы
+| Upgrade primary до io2 EBS; добавить третью read replica; рассмотреть partitioning по месяцам для inference_logs
+
+| SLA требование >99.99% (Four Nines)
+| Бизнес-требование; текущий error budget 43 мин/мес недостаточен
+| Single-region архитектура не защищает от регионального сбоя AWS (RPO > 0, RTO > 10 мин)
+| Multi-region active-active: две независимые инсталляции в разных регионах; Global Load Balancer (AWS Global Accelerator); CockroachDB или Aurora Global Database вместо PostgreSQL Multi-AZ
+|===
+
+NOTE: Переход к каждому следующему уровню значительно увеличивает сложность операций и стоимость. Рекомендуется двигаться последовательно, опираясь на измеренные метрики, а не на предположения.
+
 ==== Требования к хранению
 
 [cols="2,2,2"]
@@ -8,27 +123,27 @@
 
 | Артефакты моделей (S3)
 | 1 TB
-| 100 моделей × 10GB в среднем
+| 100 моделей × 10 GB в среднем (NFR-501: 10 TB потолок, квота Standard 200 GB/тенант)
 
 | Метаданные PostgreSQL
 | 10 GB
-| Модели + версии + развёртывания + аудит
+| Модели + версии + развёртывания + аудит-логи за 30 дней (NFR-505)
 
 | Кэш Redis
 | 8 GB
-| 1M кэшированных предсказаний × 8KB в среднем
+| 1M кэшированных предсказаний × 8 KB в среднем
 
 | Метрики Prometheus
 | 50 GB / месяц
-| 100 моделей × 10 метрик × scrape 15s
+| 100 моделей × 10 метрик × scrape 15s × 30 дней (NFR-502: детально 90 дней)
 
 | Batch Input (managed)
 | 500 GB
-| 50 тенантов × 10GB quota
+| 50 тенантов × 10 GB quota (NFR-303: до 50 тенантов)
 
 | Batch Output (managed)
 | 1 TB
-| Результаты обычно больше входных данных (2x)
+| Результаты обычно больше входных данных (2×)
 |===
 
 NOTE: Для BYOB-клиентов данные хранятся в их buckets — не учитываются в оценках платформы.
@@ -41,7 +156,7 @@ NOTE: Для BYOB-клиентов данные хранятся в их buckets
 
 | Запросы инференса
 | 10 000 RPS
-| Целевая пиковая пропускная способность платформы
+| Целевая пиковая пропускная способность платформы (NFR-104)
 
 | Чтение реестра моделей
 | 100 RPS
@@ -51,7 +166,149 @@ NOTE: Для BYOB-клиентов данные хранятся в их buckets
 | 10 RPS
 | Развёртывания, изменения состояний
 
-| Запись аудит-логов
+| Запись в аудит-логи
 | 50 RPS
 | Все изменения состояний + действия пользователей
 |===
+
+==== Сетевая нагрузка
+
+Расчёт основан на NFR-101 (latency ≤100ms p99), NFR-104 (1000 RPS/инстанс), NFR-107/108 (batch throughput).
+
+===== Inference: входящий и исходящий трафик
+
+Предположения:
+* Средний размер запроса инференса: ~1 KB (структурированные данные / embedding vector)
+* Средний размер ответа: ~0.5 KB
+* Пиковая нагрузка: 10 000 RPS (NFR-104 × 10 инстансов)
+
+[cols="2,2,2"]
+|===
+| Направление | Формула | Результат
+
+| Ingress (запросы → платформа)
+| 10 000 RPS × 1 KB
+| ~10 MB/s (80 Mbit/s)
+
+| Egress (платформа → клиент)
+| 10 000 RPS × 0.5 KB
+| ~5 MB/s (40 Mbit/s)
+
+| Kafka inference events (аудит)
+| 10 000 RPS × 0.2 KB
+| ~2 MB/s (16 Mbit/s)
+|===
+
+===== Batch: чтение и запись S3
+
+Предположения на основе NFR-107 и NFR-108:
+* Лёгкий batch: 10 000 записей/сек, средний размер записи ~0.5 KB
+* Тяжёлый batch: 500 записей/сек, средний размер записи ~10 KB
+
+[cols="2,2,2"]
+|===
+| Режим | Формула | Пропускная способность S3
+
+| Лёгкий batch (read S3)
+| 10 000 records/s × 0.5 KB
+| ~5 MB/s на worker
+
+| Лёгкий batch (write S3)
+| 10 000 records/s × 1 KB (результат)
+| ~10 MB/s на worker
+
+| Тяжёлый batch (read S3)
+| 500 records/s × 10 KB
+| ~5 MB/s на worker
+
+| Тяжёлый batch (write S3)
+| 500 records/s × 20 KB (результат)
+| ~10 MB/s на worker
+|===
+
+NOTE: При 5 параллельных batch-задачах суммарная нагрузка на S3: ~25–50 MB/s read + ~50 MB/s write. S3 пропускная способность не является узким местом при стандартном multi-part upload.
+
+===== Kafka: суммарный трафик
+
+[cols="2,2"]
+|===
+| Топик | Оценочный трафик
+
+| inference-events
+| ~2 MB/s (10K RPS × 200 bytes)
+
+| batch-job-status
+| ~0.1 MB/s (редкие события жизненного цикла)
+
+| audit-log
+| ~0.05 MB/s (50 событий/сек × 1 KB)
+
+| *Итого*
+| *~2.2 MB/s (18 Mbit/s)*
+|===
+
+==== PostgreSQL IOPS
+
+Расчёт на основе пропускной способности из раздела выше и NFR-503 (бэкапы).
+
+Предположения:
+* Один write = 1 IOPS (INSERT/UPDATE)
+* Один read = 1 IOPS; кэш-hit rate PostgreSQL ~90% (shared_buffers + pgBouncer)
+
+[cols="2,2,2"]
+|===
+| Операция | Частота | IOPS
+
+| Inference log writes
+| 10 000 RPS × 10% sampling
+| ~1 000 IOPS write
+
+| Audit log writes
+| 50 RPS
+| ~50 IOPS write
+
+| Model registry reads (с кэшом)
+| 100 RPS × 10% miss rate
+| ~10 IOPS read
+
+| Batch job status updates
+| ~10 RPS
+| ~10 IOPS write
+
+| *Итого (с 2× запасом)*
+| —
+| *~2 200 IOPS*
+|===
+
+NOTE: Стандартный AWS gp3 EBS даёт 3 000 IOPS базово (до 16 000 при provision). 2 200 IOPS укладываются в базовый tier с запасом. При росте inference sampling или tenant-ов — перейти на io2.
+
+==== Обоснование числа инстансов
+
+===== Inference-серверы
+
+Из NFR-104: 1 инстанс = 1 000 RPS. При пиковой нагрузке 10 000 RPS:
+
+* Минимум: 10 инстансов
+* С учётом headroom 1.2× (NFR-304a): 12 инстансов
+* С учётом rolling update (один узел недоступен): **13 инстансов**
+
+Автомасштабирование: min=3, max=20, trigg при CPU >70% или RPS >800/инстанс (NFR-304: реакция ≤2 мин).
+
+===== Batch Workers
+
+Из NFR-107: лёгкий worker — 10 000 записей/сек. Из NFR-305: задача до 1M+ записей.
+
+Для параллельной обработки 5 задач одновременно:
+* 5 лёгких workers (каждый ~1 vCPU, 2 GB RAM)
+* 2 тяжёлых workers (каждый ~4 vCPU, 8 GB RAM + GPU при необходимости)
+
+===== PostgreSQL
+
+* 1 primary + 2 read replica (NFR-204: отсутствие SPOF для High-класса)
+* Инстанс: 8 vCPU, 32 GB RAM (shared_buffers ~8 GB = 25% RAM)
+* При росте >5 000 IOPS — вертикальный scale до 16 vCPU или переход на io2
+
+===== Redis
+
+* 1 primary + 1 replica (NFR-201: SLA 99.9%)
+* Инстанс: 2 vCPU, 16 GB RAM (кэш 8 GB + overhead)

@@ -1,0 +1,71 @@
+@startuml observability
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+LAYOUT_WITH_LEGEND()
+
+title Observability Stack — Enterprise ML Platform
+
+Person(oncall, "On-Call Engineer", "SRE / Platform Team")
+Person(ds, "Data Scientist / ML Ops", "Мониторинг качества моделей")
+
+System_Boundary(platform, "Enterprise ML Platform") {
+
+    System_Boundary(app_tier, "Application Tier") {
+        Container(api_gw, "API Gateway", "Kong/Envoy", "Метрики: RPS, latency, 5xx rate")
+        Container(inference_svc, "Inference Service", "Triton", "Метрики: p50/p95/p99 latency, throughput, GPU util")
+        Container(model_svc, "Model Service", "FastAPI", "Метрики: model ops, state transitions")
+        Container(deploy_svc, "Deployment Service", "Go", "Метрики: deploy duration, rollback count")
+        Container(batch_worker, "Batch Workers", "Python", "Метрики: records/sec, job duration, error rate")
+    }
+
+    System_Boundary(collect_tier, "Collection Tier") {
+        Container(prom_agent, "Prometheus Agent / Scraper", "Prometheus", "Pull метрики каждые 15s от всех сервисов")
+        Container(otel_col, "OpenTelemetry Collector", "OTel", "Агрегация логов и трейсов. Батчинг.")
+        Container(fluent, "Fluent Bit", "Fluent Bit", "Сбор логов из stdout/stderr подов K8s")
+    }
+
+    System_Boundary(store_tier, "Storage Tier") {
+        ContainerDb(victoria, "VictoriaMetrics", "TSDB", "Метрики: 15s гранулярность / 90 дней. Агрегаты 1ч / 1 год")
+        ContainerDb(loki, "Loki", "Log Store", "Логи: горячие 30 дней, холодные 1 год (S3 backend)")
+        ContainerDb(tempo, "Tempo", "Trace Store", "Трейсы: 7 дней retention (Future: hw3)")
+    }
+
+    System_Boundary(viz_tier, "Visualization & Alerting") {
+        Container(grafana, "Grafana", "Grafana", "Дашборды: SLO, Inference, Batch, System, Model Quality")
+        Container(alertmanager, "Alertmanager", "Alertmanager", "Дедупликация, группировка, маршрутизация алертов")
+    }
+}
+
+System_Ext(pagerduty, "PagerDuty / OpsGenie", "Эскалация инцидентов. On-call ротация")
+System_Ext(messenger, "Мессенджер команды", "Уведомления P2/P3 (Telegram, Slack, MS Teams — на выбор)")
+
+Rel(api_gw, prom_agent, "metrics /metrics", "Prometheus exposition format")
+Rel(inference_svc, prom_agent, "metrics /metrics", "Prometheus exposition format")
+Rel(model_svc, prom_agent, "metrics /metrics")
+Rel(deploy_svc, prom_agent, "metrics /metrics")
+Rel(batch_worker, prom_agent, "metrics /metrics")
+
+Rel(api_gw, otel_col, "traces", "OTLP gRPC (Future)")
+Rel(inference_svc, otel_col, "traces", "OTLP gRPC (Future)")
+
+Rel(api_gw, fluent, "stdout logs", "JSON structured")
+Rel(inference_svc, fluent, "stdout logs", "JSON structured")
+Rel(model_svc, fluent, "stdout logs", "JSON structured")
+
+Rel(prom_agent, victoria, "remote_write", "Метрики каждые 15s")
+Rel(fluent, loki, "HTTP push", "Логи в реальном времени")
+Rel(otel_col, tempo, "OTLP", "Трейсы (Future)")
+
+Rel(victoria, grafana, "PromQL", "Визуализация метрик")
+Rel(loki, grafana, "LogQL", "Визуализация логов")
+Rel(tempo, grafana, "TraceQL", "Визуализация трейсов (Future)")
+
+Rel(victoria, alertmanager, "ALERTS", "Prometheus alerting rules")
+Rel(alertmanager, pagerduty, "HTTP webhook", "P0/P1 инциденты")
+Rel(alertmanager, messenger, "HTTP webhook", "P2/P3 уведомления")
+
+Rel(grafana, oncall, "Browser / Mobile", "Дашборды SLO")
+Rel(alertmanager, oncall, "PagerDuty push", "P0/P1 пейджинг")
+Rel(grafana, ds, "Browser", "Model quality дашборды")
+
+@enduml

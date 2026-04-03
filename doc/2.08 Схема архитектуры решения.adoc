@@ -6,6 +6,214 @@ image::c4-container.png[C4 Container Diagram, width=900]
 
 _Исходник: link:diagrams/sources/c4-container.puml[c4-container.puml]_
 
+==== Подход к фазам проектирования
+
+Документация hw2 проектируется для фазы **Baseline/Alpha**: 11 функциональных требований, 1 тенант, 1 регион, SLO 99.9%. Это осознанный выбор области проектирования, а не упрощение.
+
+При этом архитектура заложена так, чтобы расширяться до MVP (multi-tenancy, автоматизация Chaos Mesh, batch quota per tenant) и Future (multi-region active-active, distributed tracing) без переписывания ключевых компонентов. Конкретные примеры: SLO определены для Baseline, но структура алертов масштабируема на любое число тенантов через labels; трейсы (Tempo + OTel Collector) вынесены в Future и описаны как слот в стеке, а не удалены; Regional DR описан как "passive warm standby, полная автоматизация в MVP".
+
+Рассматривались три альтернативы: *(a)* проектировать сразу для Future (multi-region, multi-cluster) — отвергнуто как overengineering для текущей фазы, значительно увеличивает стоимость и сложность без измеримой пользы; *(b)* проектировать только Baseline без задела — отвергнуто, т.к. потребует рефакторинга HPA, observability-стека и схемы данных при переходе к MVP; *(c)* выбранный подход — Baseline с явными "extension points": KEDA для scale-to-zero (нужен и сейчас), VictoriaMetrics вместо standalone Prometheus (масштабируется горизонтально), tenant_id как label в метриках (не стоит ничего, но нужен в MVP).
+
+==== HA-топология развёртывания
+
+image::ha-deployment.png[HA Deployment Diagram, width=900]
+
+_Исходник: link:diagrams/sources/ha-deployment.puml[ha-deployment.puml]_
+
+Платформа развёртывается в трёх Availability Zones одного региона (active-active). Это обеспечивает:
+
+* Выживание при отказе одной AZ без ручного вмешательства (NFR-204)
+* RTO < 2 мин при AZ failure (NLB health check + K8s pod rescheduling)
+* Zero data loss для PostgreSQL (Multi-AZ synchronous replication)
+
+==== Replica Sets и высокая доступность
+
+[cols="2,2,2,3"]
+|===
+| Компонент | Min реплики | Распределение | Стратегия HA
+
+| API Gateway
+| 4 (2 per active AZ)
+| AZ-A: 2, AZ-B: 2
+| Kubernetes PodAntiAffinity: по одному поду на ноду
+
+| Inference Service
+| 6 (2 per AZ)
+| AZ-A: 2, AZ-B: 2, AZ-C (GPU): 2
+| PodAntiAffinity + GPU nodeSelector
+
+| Model Service
+| 4 (2 per active AZ)
+| AZ-A: 2, AZ-B: 2
+| PodAntiAffinity
+
+| Deployment Service
+| 2 (active-passive через leader election)
+| AZ-A: 1, AZ-B: 1
+| Kubernetes lease-based leader election
+
+| PostgreSQL
+| 1 primary + 2 read replicas
+| AZ-A: primary, AZ-B: replica-1, AZ-C: replica-2
+| RDS Multi-AZ: sync replication primary↔replica-1, async replica-2
+
+| Redis
+| 1 primary + 1 replica
+| AZ-A: primary, AZ-B: replica
+| ElastiCache Redis Sentinel: автоматический failover ≤30s
+
+| Kafka
+| 3 брокера (RF=3, min.ISR=2)
+| По одному брокеру на AZ
+| min.ISR=2: запись подтверждена 2 брокерами; при потере 1 — работает
+
+| Batch Workers
+| 2 min (CPU), 1 min (GPU)
+| AZ-C preferred (GPU nodes)
+| KEDA event-driven: масштабируется по Kafka lag
+|===
+
+==== Load Balancer и Health Checks
+
+===== Уровни балансировки
+
+[cols="2,2,3,2"]
+|===
+| Уровень | Технология | Назначение | Health Check
+
+| L4 (Network LB)
+| AWS NLB
+| TCP балансировка. Anycast IP. Минимальная латентность.
+| TCP connect каждые 10s; порог: 3 consecutive failures → unhealthy
+
+| L7 (Application LB)
+| AWS ALB
+| HTTP/HTTPS. Path-based routing: /v1/predict → Inference, /v1/models → Model Service.
+| HTTP GET /health каждые 15s; 200 = healthy
+
+| Internal (Service Mesh)
+| Kubernetes Service (ClusterIP)
+| Внутренняя балансировка между подами сервиса. Round-robin по умолчанию.
+| Kubernetes readiness probe: HTTP /readyz каждые 5s
+|===
+
+===== Readiness и Liveness Probes
+
+[cols="2,3,2,2"]
+|===
+| Probe | Endpoint | Критерий healthy | Действие при failure
+
+| Readiness
+| `GET /readyz`
+| HTTP 200 + model loaded + DB connection OK
+| Под исключается из балансировки (трафик не идёт)
+
+| Liveness
+| `GET /livez`
+| HTTP 200 (сервис отвечает, не deadlock)
+| K8s перезапускает под
+
+| Startup
+| `GET /livez`
+| HTTP 200 (для медленного старта при cold start)
+| Grace period 30s перед первой liveness проверкой
+|===
+
+Пример конфигурации для Inference Service:
+
+[source,yaml]
+----
+livenessProbe:
+  httpGet:
+    path: /livez
+    port: 8080
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+readinessProbe:
+  httpGet:
+    path: /readyz
+    port: 8080
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  failureThreshold: 2
+startupProbe:
+  httpGet:
+    path: /livez
+    port: 8080
+  failureThreshold: 30
+  periodSeconds: 10
+----
+
+==== Auto-scaling конфигурация
+
+===== HPA (Horizontal Pod Autoscaler)
+
+[source,yaml]
+----
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: inference-service-hpa
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: inference-service
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Pods
+    pods:
+      metric:
+        name: mlp_inference_requests_per_second
+      target:
+        type: AverageValue
+        averageValue: "800"  # NFR-104: 1000 RPS/инстанс × headroom 0.8
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60    # Быстрое масштабирование вверх
+      policies:
+      - type: Pods
+        value: 4
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300   # Медленное масштабирование вниз
+      policies:
+      - type: Pods
+        value: 2
+        periodSeconds: 120
+----
+
+NOTE: Время реакции автомасштабирования ≤2 мин (NFR-304). `scaleUpStabilizationWindowSeconds: 60` обеспечивает быстрый ответ на рост. `scaleDownStabilizationWindowSeconds: 300` предотвращает флаппинг.
+
+===== Circuit Breaker
+
+Circuit Breaker реализован в Inference Service для защиты от каскадных отказов при деградации GPU Pool:
+
+[cols="1,2,2"]
+|===
+| Состояние | Условие перехода | Поведение
+
+| Closed (норма)
+| —
+| Запросы проходят к GPU
+
+| Open (обрыв)
+| Error rate >50% за 10s или timeout >5s для 3 подряд запросов
+| Возвращает ошибку 503 немедленно; пробная пауза 30s
+
+| Half-Open (проверка)
+| После 30s паузы
+| Пропускает 10% запросов; если OK → Closed, иначе → Open снова
+|===
+
 ==== Коммуникация компонентов
 
 [cols="2,2,2,2"]

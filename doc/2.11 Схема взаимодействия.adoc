@@ -1,0 +1,223 @@
+=== Схема взаимодействия микросервисов
+
+ifndef::imagesdir[:imagesdir: {docdir}/../diagrams]
+
+==== Принципы выбора sync vs async
+
+Взаимодействие между компонентами строится на основании двух критериев: *ожидает ли клиент ответа немедленно* и *допускает ли операция длительное выполнение без потери связи*. Нарушение этого принципа приводит либо к избыточной latency (async там, где нужен sync), либо к ненадёжным долгим соединениям (sync там, где нужен async).
+
+.Выбор модели взаимодействия по типу операции
+[cols="2,1,1,3"]
+|===
+| Операция | Модель | Протокол | Обоснование
+
+| Синхронный инференс
+| Sync
+| gRPC (HTTP/2)
+| Клиент ждёт предсказание. SLA p99 ≤100ms (NFR-101). gRPC + Protobuf снижают overhead сериализации vs REST+JSON на ~10-15ms на критическом пути.
+
+| Управление моделями (CRUD)
+| Sync
+| REST/HTTP
+| Нечастые административные операции. Latency не критична. REST читаем человеком, легко интегрируется с CI/CD и скриптами.
+
+| Запрос развёртывания модели
+| Sync (submit) + Async (pipeline)
+| REST → Kafka
+| Клиент получает 202 Accepted немедленно. Конвейер развёртывания (валидация, K8s deploy, health checks) занимает минуты — держать HTTP-соединение открытым нецелесообразно.
+
+| Конвейер развёртывания
+| Async (event-driven)
+| Kafka (deploy-events)
+| Deployment Service реагирует на событие независимо от жизни HTTP-сессии MLE. Kafka гарантирует at-least-once delivery при сбое.
+
+| Batch inference
+| Async (submit + polling)
+| REST → Kafka
+| Обработка от минут до часов (NFR-108). Sync connection невозможен технически (timeouts). Polling — простейший паттерн для Baseline без WebSocket/callback.
+
+| Логирование инференса
+| Async (fire-and-forget)
+| Kafka (inference-logs)
+| Не должно блокировать ответ клиенту. Kafka абсорбирует пики нагрузки. Потеря единичного log-события допустима.
+
+| Метрики (observability)
+| Async (scrape)
+| Prometheus pull
+| Pull-модель: сервисы экспортируют /metrics, Prometheus scrape каждые 15s. Не влияет на критический путь.
+|===
+
+==== Связь sync/async с NFR
+
+* *NFR-101* (p99 ≤100ms) → инференс sync gRPC: минимальный overhead, предсказуемая latency
+* *NFR-108* (batch ≤30 мин / ≤2 ч) → batch async Kafka: обработка параллельными workers
+* *NFR-204* (RTO ≤2 мин при AZ failure) → async через Kafka: сообщения не теряются при перезапуске consumer
+* *NFR-304* (auto-scaling ≤2 мин) → KEDA по Kafka lag: масштабирование batch workers по очереди
+
+==== Расчёт технической нагрузки: 1 бизнес-запрос → N технических
+
+NFR задают бизнес-метрики (1000 RPS инференса). Каждый бизнес-запрос порождает цепочку внутренних вызовов. Без этого расчёта невозможно правильно задать ресурсы компонентов.
+
+.Декомпозиция нагрузки: синхронный инференс (1000 RPS)
+[cols="3,1,3"]
+|===
+| Технический вызов | RPS | Комментарий
+
+| Redis auth cache (GET api_key)
+| ~1000
+| 1 запрос на каждый входящий. Hit rate ~99% (TTL 5 мин).
+
+| Redis rate limit (INCR)
+| ~1000
+| 1 атомарный инкремент на запрос.
+
+| Redis prediction cache (GET)
+| ~1000
+| 1 проверка на запрос.
+
+| GPU / Triton (Predict)
+| ~150
+| Cache hit rate ~85%: только ~15% запросов доходят до GPU.
+
+| Redis prediction cache (SET)
+| ~150
+| Только при cache miss.
+
+| Kafka produce (inference-logs)
+| ~1000
+| Async, fire-and-forget.
+
+| *Итого Redis*
+| *~3150*
+| Redis под суммарную нагрузку ~3200 RPS при 1000 RPS инференса.
+
+| *Итого GPU*
+| *~150*
+| GPU под ~150 реальных инференс-запросов/с при 85% cache hit rate.
+|===
+
+.Декомпозиция нагрузки: развёртывание модели (редкие операции)
+[cols="3,1,3"]
+|===
+| Технический вызов | Частота | Комментарий
+
+| PostgreSQL INSERT/UPDATE (model state)
+| ~5-10/мин
+| Нечастые административные операции.
+
+| Kafka produce (deploy-events)
+| ~5-10/мин
+| 1 событие на deploy request.
+
+| Kafka consume (Deployment Service)
+| ~5-10/мин
+| 1:1 с produce.
+
+| Kubernetes API calls
+| ~20-50/мин
+| Deployment + Service + HPA + health check polling.
+
+| Kafka produce (deploy-events результат)
+| ~5-10/мин
+| DeploymentSucceeded / DeploymentFailed.
+|===
+
+.Декомпозиция нагрузки: batch inference (MVP phase)
+[cols="3,1,3"]
+|===
+| Технический вызов | Частота | Комментарий
+
+| Kafka produce (batch-jobs)
+| 1 на job submit
+| Низкая частота submits.
+
+| S3 GET (input)
+| 1 на job
+| Может быть GB данных.
+
+| GPU / Triton (Predict) per record
+| 10K-10M на job
+| Основная нагрузка на GPU.
+
+| PostgreSQL UPDATE (job status)
+| ~10 на job
+| Обновления прогресса.
+
+| S3 PUT (output)
+| 1 на job
+| Результаты predictions.
+|===
+
+==== Диаграмма 1: Синхронный инференс
+
+image::seq-inference-sync.png[Синхронный инференс, width=900]
+
+_Исходник: link:diagrams/sources/seq-inference-sync.puml[seq-inference-sync.puml]_
+
+Поток описывает критический путь запроса предсказания. Ключевые аспекты:
+
+* *WAF + ALB* — сетевой периметр: фильтрация до попадания трафика в кластер
+* *Auth cache в Redis* — API-ключ проверяется за ≤1ms по кэшу, без обращения к PostgreSQL
+* *Token Bucket rate limiting* — атомарный INCR в Redis, не блокирует critical path
+* *Cache hit/miss alt* — при hit rate 85% 850 из 1000 запросов не доходят до GPU
+* *Circuit Breaker* — при деградации GPU немедленный 503 вместо накопления очереди (подробнее в <<_схема_архитектуры_решения>>)
+* *Fire-and-forget Kafka produce* — логирование не влияет на p99 latency ответа клиенту
+
+==== Диаграмма 2: Развёртывание модели
+
+image::seq-model-deploy.png[Развёртывание модели, width=900]
+
+_Исходник: link:diagrams/sources/seq-model-deploy.puml[seq-model-deploy.puml]_
+
+Поток описывает event-driven конвейер развёртывания с явными переходами FSM:
+
+* *202 Accepted немедленно* — MLE не ждёт конца конвейера (минуты). Polling для статуса.
+* *Kafka как транспорт событий* — развязка Model Service и Deployment Service. Сбой одного не блокирует другой.
+* *Temporal Workflow* — гарантирует exactly-once переходы состояний FSM, автоматические retry при transient failures
+* *Автооткат при failure* — FSM переход STAGING → DRAFT при CrashLoopBackOff или провале smoke test (FR-303)
+* *Оптимистичная блокировка* в PostgreSQL при переходах состояний предотвращает race condition параллельных deploy-запросов
+
+Связь с конечным автоматом модели: диаграмма состояний — link:diagrams/sources/state-model.puml[state-model.puml], описание переходов — <<_потоки_данных_и_высокоуровневое_взаимодействие>>.
+
+==== Диаграмма 3: Async batch inference
+
+image::seq-batch-inference.png[Async batch inference, width=900]
+
+_Исходник: link:diagrams/sources/seq-batch-inference.puml[seq-batch-inference.puml]_
+
+Поток описывает асинхронную обработку больших объёмов данных:
+
+* *Submit + polling* — единственный практичный паттерн для обработки часами. Callback/webhook добавляются в Future.
+* *KEDA scale-from-zero* — Batch Workers запускаются только при наличии заданий в Kafka. Нет простаивающих GPU-нод.
+* *DLQ* — задания, не обработанные после 5 попыток, изолируются в `batch-jobs-dlq`. Worker не застревает, продолжает обрабатывать очередь (FR-405 — MVP phase).
+* *Exponential backoff* — retry не создаёт thundering herd при восстановлении GPU (FR-404 — MVP phase).
+* *FSM batch job*: Submitted → Queued → Running → Completed / Failed
+
+NOTE: Batch inference (FR-401–FR-405) — MVP phase. В Baseline/Alpha поддерживается архитектурный паттерн как задел: Kafka топик `batch-jobs` и Batch Service присутствуют в диаграмме контейнеров, реализация воркеров — в MVP.
+
+==== Observability взаимодействия
+
+Каждый запрос проходит через систему с `request_id`, генерируемым на API Gateway. Этот ID логируется на каждом hop и позволяет коррелировать события без distributed tracing (Tempo + OTel — Future).
+
+[cols="2,3,2"]
+|===
+| Компонент | Что логируется | Формат
+
+| API Gateway
+| request_id, tenant_id, method, path, status, latency_ms
+| JSON structured log
+
+| Inference Service
+| request_id, model_id, cache_hit, gpu_latency_ms, circuit_breaker_state
+| JSON structured log
+
+| Deployment Service
+| request_id, model_id, fsm_transition, duration_ms, error
+| JSON structured log
+
+| Batch Workers
+| job_id, records_processed, chunk_latency_ms, retry_count, error
+| JSON structured log
+|===
+
+Подробнее: link:2.09%20Observability.adoc[2.09 Observability].

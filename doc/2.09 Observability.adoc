@@ -1,0 +1,496 @@
+=== Observability
+
+ifndef::imagesdir[:imagesdir: {docdir}/../diagrams]
+
+==== Обзор и цели
+
+Observability — это способность системы объяснять своё внутреннее состояние по внешним сигналам (метрики, логи, трейсы). Для ML Platform observability преследует три цели:
+
+1. **Надёжность** — обнаружить деградацию раньше клиента, соблюдать SLO.
+2. **Качество моделей** — зафиксировать дрифт, аномальный output, деградацию точности.
+3. **Операционная эффективность** — находить узкие места, обосновывать решения по масштабированию.
+
+==== Архитектура стека
+
+image::observability.png[Observability Stack, width=900]
+
+_Исходник: link:diagrams/sources/observability.puml[observability.puml]_
+
+Стек построен на трёх уровнях: сбор → хранение → визуализация/алертинг. Каждый уровень независимо масштабируется и может быть заменён без изменений в приложениях.
+
+[cols="2,2,3"]
+|===
+| Уровень | Компонент | Роль
+
+| Сбор
+| Prometheus Agent
+| Pull-модель: scraping /metrics каждые 15s. Буферизация при network split.
+
+| Сбор
+| Fluent Bit
+| Tail логов из stdout/stderr K8s подов. Structured JSON. Нет disk buffer (ephemeral sidecar).
+
+| Сбор
+| OpenTelemetry Collector
+| Distributed tracing (Future, hw3). Сейчас — только метрики через remote_write.
+
+| Хранение
+| VictoriaMetrics
+| TSDB: 15s гранулярность 90 дней, downsampled 1h агрегаты 1 год (NFR-502). Выбран вместо Prometheus за горизонтальное масштабирование и сжатие 10:1 против Prometheus.
+
+| Хранение
+| Loki
+| Логи. Backend — S3. Hot 30 дней, cold 1 год (NFR-505). Без индексации — логи ищутся по labels.
+
+| Хранение
+| Tempo
+| Трейсы (Future). Retention 7 дней.
+
+| Визуализация
+| Grafana
+| Единый UI для метрик (PromQL), логов (LogQL), трейсов (TraceQL).
+
+| Алертинг
+| Alertmanager
+| Дедупликация, group_wait 30s, маршрутизация P0/P1 → PagerDuty, P2/P3 → мессенджер команды.
+|===
+
+NOTE: В Baseline/Alpha фазе трейсы (Tempo + OTel) откладываются. Достаточно structured logs с `request_id` для корреляции (см. hw3).
+
+==== Метрики
+
+===== Принципы именования
+
+Метрики следуют соглашению Prometheus: `{namespace}_{subsystem}_{name}_{unit}`.
+
+* `mlp_` — общий namespace платформы
+* `_seconds` / `_bytes` / `_total` — стандартные суффиксы
+* Labels: `tenant_id`, `model_id`, `version`, `region` — для multi-dimensional aggregation
+
+===== Метрики инференса (Критические — SLO)
+
+[cols="2,3,2,2"]
+|===
+| Метрика | Описание | Тип | Связь с NFR
+
+| `mlp_inference_duration_seconds`
+| Латентность ответа на запрос инференса (bucket histogram)
+| Histogram
+| NFR-101: p99 ≤100ms
+
+| `mlp_inference_requests_total`
+| Счётчик запросов с labels: `status`, `model_id`, `tenant_id`
+| Counter
+| NFR-104: 1000 RPS/инстанс
+
+| `mlp_inference_errors_total`
+| Ошибки по типу: `model_error`, `timeout`, `circuit_open`
+| Counter
+| Алерт: error rate >1%
+
+| `mlp_inference_cache_hits_total`
+| Cache hits Redis
+| Counter
+| Эффективность кэша
+
+| `mlp_inference_cache_misses_total`
+| Cache misses Redis
+| Counter
+| Эффективность кэша
+
+| `mlp_inference_model_load_duration_seconds`
+| Время загрузки модели при cold start
+| Histogram
+| NFR-103: ≤5s
+
+| `mlp_gpu_utilization_percent`
+| Утилизация GPU по `device_id`, `model_id`
+| Gauge
+| Сигнал для auto-scaling
+|===
+
+===== Метрики batch inference
+
+[cols="2,3,2,2"]
+|===
+| Метрика | Описание | Тип | Связь с NFR
+
+| `mlp_batch_job_duration_seconds`
+| Полное время выполнения batch-задачи
+| Histogram
+| NFR-108: ≤30 мин / ≤2 ч
+
+| `mlp_batch_records_processed_total`
+| Записей обработано (по job, tenant)
+| Counter
+| NFR-107: ≥10K записей/сек light
+
+| `mlp_batch_records_failed_total`
+| Записей с ошибкой
+| Counter
+| Алерт: error rate >5%
+
+| `mlp_batch_jobs_active`
+| Активных batch-задач в момент
+| Gauge
+| Сигнал для HPA workers
+
+| `mlp_batch_queue_depth`
+| Глубина очереди Kafka (batch-jobs топик)
+| Gauge
+| Алерт: >100 задач в очереди
+
+| `mlp_batch_worker_throughput_records_per_second`
+| Производительность каждого worker
+| Gauge
+| Сравнение с NFR-107
+|===
+
+===== Метрики модели и lifecycle
+
+[cols="2,3,2,2"]
+|===
+| Метрика | Описание | Тип | Связь с NFR
+
+| `mlp_model_state_transitions_total`
+| Переходы состояний (draft→validating→...)
+| Counter
+| Audit + операционный мониторинг
+
+| `mlp_model_deployment_duration_seconds`
+| Время от submit до serving
+| Histogram
+| Операционная метрика
+
+| `mlp_model_rollback_total`
+| Количество откатов
+| Counter
+| Алерт: >3 откатов/час
+
+| `mlp_model_versions_active`
+| Активных версий в production
+| Gauge
+| Capacity planning
+
+| `mlp_model_inference_input_drift_score`
+| Score дрейфа входных данных (Future)
+| Gauge
+| R-02: детекция дрифта
+|===
+
+===== Системные метрики
+
+Собираются автоматически через node-exporter и kube-state-metrics:
+
+[cols="2,3,2"]
+|===
+| Метрика | Описание | Порог алерта
+
+| `container_cpu_usage_seconds_total`
+| CPU по контейнеру
+| >85% sustained 5 мин → scale out
+
+| `container_memory_usage_bytes`
+| RAM по контейнеру
+| >90% → alert
+
+| `kube_pod_status_ready`
+| Готовность пода
+| <min_replicas ready → P1
+
+| `kafka_consumer_lag_sum`
+| Lag Kafka consumer group
+| >10 000 сообщений → alert
+
+| `redis_memory_used_bytes`
+| Использование памяти Redis
+| >80% capacity → alert
+
+| `postgresql_connections_active`
+| Активных соединений PostgreSQL
+| >80% max_connections → alert
+
+| `postgresql_replication_lag_bytes`
+| Отставание реплики PostgreSQL
+| >50 MB → alert
+|===
+
+==== Логирование
+
+===== Структура логов
+
+Все сервисы пишут структурированные JSON-логи в stdout. Fluent Bit собирает без изменений.
+
+[source,json]
+----
+{
+  "timestamp": "2025-04-04T12:00:00.123Z",
+  "level": "INFO",
+  "service": "inference-service",
+  "request_id": "req-abc-123",
+  "tenant_id": "tenant-42",
+  "model_id": "mdl-xyz",
+  "model_version": "1.2.0",
+  "latency_ms": 45,
+  "status": "ok",
+  "cached": false,
+  "message": "inference completed"
+}
+----
+
+Обязательные поля во всех логах: `timestamp`, `level`, `service`, `request_id`.
+
+Опциональные поля по контексту: `tenant_id`, `model_id`, `model_version`, `job_id`, `user_id`.
+
+===== Уровни логирования
+
+[cols="1,3,2"]
+|===
+| Уровень | Когда использовать | Пример
+
+| ERROR
+| Неожиданный сбой, требующий вмешательства
+| Недоступен GPU, сбой записи в PostgreSQL
+
+| WARN
+| Деградация, не влияющая на availability
+| Высокий cache miss rate, retry №2
+
+| INFO
+| Нормальные операционные события
+| Запрос завершён, модель загружена
+
+| DEBUG
+| Детали для отладки (по умолчанию выключен в prod)
+| Параметры запроса, payload размеры
+|===
+
+NOTE: DEBUG-уровень активируется per-tenant через feature flag в runtime без перезапуска сервисов. Срок действия — максимум 1 час (безопасность).
+
+===== Retention логов
+
+[cols="2,2,2,2"]
+|===
+| Тип лога | Hot (Loki) | Cold (S3) | Удаление
+
+| Application logs
+| 30 дней
+| 1 год
+| Через 1 год
+
+| Audit logs
+| 30 дней
+| 7 лет
+| Никогда (комплаенс)
+
+| Inference logs (sample)
+| 7 дней
+| 30 дней
+| Через 30 дней
+
+| System logs (K8s)
+| 7 дней
+| 30 дней
+| Через 30 дней
+|===
+
+==== SLO и Error Budget
+
+===== Определение SLO
+
+SLO (Service Level Objective) — измеримые цели, фиксирующие "достаточно хорошее" качество сервиса. Error Budget = допустимый объём нарушений за расчётный период (30 дней).
+
+[cols="2,3,2,2,2"]
+|===
+| SLO | Определение | Цель | Error Budget/мес | Связь с NFR
+
+| Availability
+| `good_requests / total_requests` где good = HTTP 2xx/3xx или gRPC OK
+| 99.9%
+| 43.2 мин downtime
+| NFR-201
+
+| Latency p99
+| Доля запросов с latency < 100ms
+| 99%
+| 1% запросов может превысить
+| NFR-101
+
+| Latency p95
+| Доля запросов с latency < 70ms
+| 95%
+| 5% запросов может превысить
+| NFR-101
+
+| Batch SLA
+| Доля batch-задач завершённых в срок
+| 98%
+| 2% задач может опоздать
+| NFR-108
+|===
+
+===== SLO Dashboard
+
+Grafana содержит дашборд "SLO Overview" с:
+
+* Burn rate (сколько error budget сожжено сегодня)
+* Error budget remaining (% за текущий период)
+* SLO windows: 1h, 6h, 24h, 72h
+* Алерт при burn rate >14× (burn за 1h сжигает 2% месячного бюджета)
+
+==== Алертинг
+
+===== Приоритеты
+
+[cols="1,2,3,2,2"]
+|===
+| Уровень | Название | Критерий | Реакция | Канал
+
+| P0
+| Critical
+| SLO availability < 99% за 5 мин окно; Inference Service недоступен; Все реплики нездоровы
+| Немедленный пейджинг on-call. Ответ ≤5 мин
+| PagerDuty (звонок)
+
+| P1
+| High
+| Error rate >1% sustained 10 мин; p99 >200ms sustained 5 мин; Репликация PostgreSQL lag >50 MB; Redis недоступен
+| Пейджинг on-call. Ответ ≤15 мин
+| PagerDuty (push)
+
+| P2
+| Medium
+| Cache hit rate <50% sustained 1 час; Kafka consumer lag >10 000; Batch queue >100 задач; Rollback >3 за 1 час
+| Уведомление в мессенджер команды
+| Мессенджер команды (Telegram, Slack, MS Teams — на выбор)
+
+| P3
+| Low
+| Disk usage >80%; CPU >85% sustained; Нет метрик от сервиса >5 мин
+| Ticket в backlog
+| Мессенджер команды (low priority)
+|===
+
+===== Правила алертов (примеры)
+
+[source,yaml]
+----
+groups:
+  - name: inference_slo
+    rules:
+    - alert: InferenceHighErrorRate
+      expr: |
+        (
+          rate(mlp_inference_errors_total[5m]) /
+          rate(mlp_inference_requests_total[5m])
+        ) > 0.01
+      for: 10m
+      labels:
+        severity: P1
+      annotations:
+        summary: "Inference error rate > 1%"
+        description: "Error rate {{ $value | humanizePercentage }} on {{ $labels.model_id }}"
+        runbook_url: "https://wiki/runbooks/inference-error-rate"
+
+    - alert: InferenceLatencyP99High
+      expr: |
+        histogram_quantile(0.99,
+          rate(mlp_inference_duration_seconds_bucket[5m])
+        ) > 0.2
+      for: 5m
+      labels:
+        severity: P1
+      annotations:
+        summary: "Inference p99 > 200ms (SLO breach risk)"
+        runbook_url: "https://wiki/runbooks/inference-latency"
+
+    - alert: InferenceServiceDown
+      expr: |
+        kube_deployment_status_replicas_available{deployment="inference-service"} == 0
+      for: 1m
+      labels:
+        severity: P0
+      annotations:
+        summary: "Inference Service has 0 available replicas"
+----
+
+===== Alertmanager: конфигурация маршрутизации
+
+[source,yaml]
+----
+route:
+  group_by: ['alertname', 'model_id']
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  receiver: 'messenger-default'
+  routes:
+  - match:
+      severity: P0
+    receiver: 'pagerduty-critical'
+    continue: true
+  - match:
+      severity: P1
+    receiver: 'pagerduty-high'
+    continue: true
+  - match_re:
+      severity: P2|P3
+    receiver: 'messenger-default'
+
+receivers:
+- name: 'pagerduty-critical'
+  pagerduty_configs:
+  - service_key: '<PD_CRITICAL_KEY>'
+- name: 'pagerduty-high'
+  pagerduty_configs:
+  - service_key: '<PD_HIGH_KEY>'
+# Канал уведомлений — мессенджер команды (Telegram, Slack, MS Teams — на выбор).
+# Пример ниже использует Telegram через нативный Alertmanager receiver (доступен с v0.24).
+# Для Slack: заменить на slack_configs с api_url и channel.
+# Для MS Teams: использовать webhook_configs с Teams Incoming Webhook URL.
+- name: 'messenger-default'
+  telegram_configs:
+  - bot_token: '<TELEGRAM_BOT_TOKEN>'
+    chat_id: '<TELEGRAM_CHAT_ID>'
+    message: '{{ range .Alerts }}[{{ .Labels.severity }}] {{ .Annotations.summary }}{{ end }}'
+----
+
+==== Дашборды Grafana
+
+[cols="2,3,2"]
+|===
+| Дашборд | Метрики | Аудитория
+
+| SLO Overview
+| Error budget burn, availability windows, latency percentiles
+| On-call, Management
+
+| Inference Performance
+| RPS by model/tenant, p50/p95/p99 histogram, error types, GPU utilization, cache hit rate
+| Platform Team, ML Ops
+
+| Batch Jobs
+| Active jobs, queue depth, throughput records/sec, job duration histogram, error rate by tenant
+| Platform Team, DS
+
+| Model Lifecycle
+| State transitions, deploy duration, rollback frequency, active versions
+| ML Ops
+
+| Infrastructure
+| CPU/RAM/disk per node, K8s pod health, Kafka lag, PostgreSQL IOPS, Redis memory
+| SRE
+
+| Tenant Usage
+| RPS per tenant, storage quota utilization, batch job count, error rate per tenant
+| FinOps, Platform
+|===
+
+==== Capacity Planning через метрики
+
+Observability используется для обоснованного масштабирования (НЕ по догадке):
+
+* **Inference scale-out триггер**: `mlp_inference_requests_total` rate > 800 RPS/pod sustained 2 мин → HPA добавляет реплику (NFR-304)
+* **Batch worker scale-out триггер**: `mlp_batch_queue_depth` > 20 задач → HPA добавляет batch worker (NFR-304)
+* **Scale-to-zero**: `mlp_inference_requests_total` rate == 0 за 30 мин И нет активных batch jobs → KEDA scale-to-zero (NFR-306)
+* **Vertical scaling сигнал**: PostgreSQL `container_memory_usage_bytes` > 90% + IOPS near limit → ticket на upgrade инстанса

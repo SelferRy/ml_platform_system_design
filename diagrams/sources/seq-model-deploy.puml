@@ -1,0 +1,96 @@
+@startuml seq-model-deploy
+title Развёртывание модели (Event-Driven FSM) — Enterprise ML Platform (Baseline/Alpha)
+
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 5
+
+actor "ML Engineer" as MLE
+participant "API Gateway\n(Kong/Envoy)" as GW
+participant "Model Service\n(FastAPI)" as Model
+participant "PostgreSQL" as PG
+participant "Kafka\n(deploy-events)" as Kafka
+participant "Deployment Service\n(Go/Temporal)" as Deploy
+participant "Kubernetes API" as K8s
+participant "Inference Service\n(Triton)" as Inf
+
+== Загрузка артефакта (FSM: → Draft) ==
+
+MLE -> GW : POST /v1/models\n{name, framework, artifact_url}
+GW -> Model : REST forward (аутентификация пройдена)
+Model -> PG : INSERT models (state=DRAFT,\ntenant_id, name, framework)\nidempotency_key
+PG --> Model : model_id
+Model --> GW : 201 Created {model_id, state: DRAFT}
+GW --> MLE : 201 Created {model_id}
+
+== Запрос развёртывания (FSM: Draft → Validating) ==
+
+MLE -> GW : POST /v1/models/{id}/deploy
+GW -> Model : REST forward
+Model -> PG : UPDATE state=VALIDATING WHERE id=? AND state=DRAFT\n(оптимистичная блокировка)
+PG --> Model : OK
+Model -> Kafka : produce DeploymentRequested\n{model_id, tenant_id, version, artifact_url}
+note right of Kafka
+  Topic: deploy-events
+  Kafka гарантирует at-least-once delivery.
+  Deployment Service идемпотентен по model_id+version.
+end note
+Model --> GW : 202 Accepted {model_id, state: VALIDATING}
+GW --> MLE : 202 Accepted\n(опросите GET /v1/models/{id} для статуса)
+
+== Конвейер развёртывания (async event-driven) ==
+
+Kafka -> Deploy : consume DeploymentRequested\n(CG: deployment-service)
+
+note right of Deploy
+  FSM: VALIDATING → STAGING → PRODUCTION
+  Temporal Workflow гарантирует:
+  - exactly-once переходы состояний
+  - повтор при transient failures
+  - явный откат при persistent failure
+end note
+
+Deploy -> Deploy : Валидация артефакта\n(схема входа/выхода, smoke test, FR-302)
+
+alt Валидация провалена
+    Deploy -> PG : UPDATE state=DRAFT, failure_reason=...
+    Deploy -> Kafka : produce DeploymentFailed {model_id, reason}
+    note right of Deploy : MLE получит уведомление\nчерез алертинг / polling
+else Валидация пройдена (FSM: Validating → Staging)
+    Deploy -> PG : UPDATE state=STAGING
+    Deploy -> K8s : POST /apis/apps/v1/namespaces/ml-platform/deployments\n{image, model_id, resources, replicas}
+    K8s --> Deploy : Deployment created
+
+    == Health Check Loop (FSM: Staging → Production) ==
+
+    loop Health checks (max 10 мин, FR-303)
+        Deploy -> K8s : GET /api/v1/namespaces/ml-platform/pods?labelSelector=model_id=...
+        K8s --> Deploy : Pod status (Running / Pending / CrashLoopBackOff)
+
+        Deploy -> Inf : gRPC HealthCheck.Check(model_id)\n(smoke inference с тестовыми данными)
+
+        alt Pod CrashLoopBackOff или smoke test failed
+            note right of Deploy
+              Автооткат: FSM STAGING → DRAFT.
+              K8s Deployment масштабируется до 0.
+              Предыдущая версия остаётся на 100% трафика.
+            end note
+            Deploy -> K8s : PATCH deployment replicas=0 (rollback)
+            Deploy -> PG : UPDATE state=DRAFT, failure_reason=...
+            Deploy -> Kafka : produce DeploymentRolledBack {model_id, reason}
+        else Health check passed
+            Deploy -> PG : UPDATE state=PRODUCTION
+            Deploy -> Kafka : produce DeploymentSucceeded\n{model_id, endpoint, version}
+            Deploy -> K8s : PATCH service traffic_weight=100% (canary complete)
+            note right of Deploy : FSM: STAGING → PRODUCTION\nМодель обслуживает 100% трафика
+        end
+    end
+end
+
+MLE -> GW : GET /v1/models/{id}\n(polling статуса)
+GW -> Model : REST forward
+Model -> PG : SELECT state, deployment_url WHERE id=?
+PG --> Model : {state: PRODUCTION, endpoint: ...}
+Model --> GW : 200 OK {state: PRODUCTION}
+GW --> MLE : 200 OK {model_id, state, endpoint}
+
+@enduml

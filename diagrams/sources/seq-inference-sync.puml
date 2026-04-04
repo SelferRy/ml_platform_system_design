@@ -1,0 +1,98 @@
+@startuml seq-inference-sync
+title Синхронный инференс — Enterprise ML Platform (Baseline/Alpha)
+
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 5
+skinparam sequenceParticipant underline
+
+actor "Клиент\n(Приложение)" as Client
+participant "WAF\n(AWS WAF)" as WAF
+participant "ALB\n(AWS ALB)" as ALB
+participant "API Gateway\n(Kong/Envoy)" as GW
+participant "Redis\n(auth cache)" as RedisAuth
+participant "Inference Service\n(Triton)" as Inf
+participant "Redis\n(prediction cache)" as RedisCache
+participant "GPU / Triton\n(GPU Pool)" as GPU
+participant "Kafka\n(inference-logs)" as Kafka
+
+Client -> WAF : POST /v1/infer\nHTTPS, API-Key header
+note right of WAF
+  OWASP ruleset: проверка на
+  SQL injection, XSS, payload size.
+  Блокировка при совпадении правил.
+end note
+
+WAF -> ALB : Filtered HTTP request
+
+ALB -> GW : HTTPS → HTTP\nPath-based routing: /v1/infer
+
+== Аутентификация и Rate Limiting ==
+
+GW -> RedisAuth : GET api_key:{sha256(key)}
+RedisAuth --> GW : tenant_id + permissions (cache hit ≤1ms)
+
+alt API key не найден / истёк
+    GW --> Client : 401 Unauthorized
+end
+
+GW -> RedisAuth : INCR rate_limit:{tenant_id}:{minute}\nEXPIRE 60s
+RedisAuth --> GW : current_count
+
+alt Превышен лимит (Token Bucket)
+    GW --> Client : 429 Too Many Requests\nRetry-After: 60s
+end
+
+note right of GW
+  Rate limit: 1000 req/min per tenant_id
+  (Token Bucket, configurable per plan)
+end note
+
+== Инференс ==
+
+GW -> Inf : gRPC InferenceService.Predict(request)\nrequest_id, tenant_id, model_id, inputs
+
+Inf -> RedisCache : GET prediction:{model_id}:{hash(inputs)}
+
+alt Cache Hit
+    RedisCache --> Inf : CachedPrediction (TTL 5 мин)
+    note right of Inf
+      Cache hit: пропуск GPU вызова.
+      ~85% hit rate для однотипных входных данных.
+    end note
+else Cache Miss
+    RedisCache --> Inf : nil
+
+    alt Circuit Breaker OPEN (GPU деградация)
+        note right of Inf
+          Состояние Open: error rate >50% за 10s
+          или 3 подряд timeout >5s.
+          Пауза 30s, затем Half-Open.
+        end note
+        Inf --> GW : gRPC UNAVAILABLE\n"GPU pool unavailable, retry in 30s"
+        GW --> Client : 503 Service Unavailable\nRetry-After: 30s
+    else Circuit Breaker CLOSED / HALF-OPEN
+        Inf -> GPU : Triton gRPC ModelInferRequest\n(model_name, inputs, outputs)
+        GPU --> Inf : ModelInferResponse\n(outputs, model_version)
+
+        Inf -> RedisCache : SET prediction:{model_id}:{hash(inputs)} {result}\nEX 300 (TTL 5 мин)
+        RedisCache --> Inf : OK
+    end
+end
+
+Inf -> Kafka : produce InferenceLogged\n{request_id, tenant_id, model_id,\nlatency_ms, cache_hit, timestamp}
+note right of Kafka
+  Fire-and-forget: async produce.
+  Не блокирует ответ клиенту.
+  Topic: inference-logs
+end note
+
+Inf --> GW : gRPC OK\n{prediction, model_version, latency_ms}
+GW --> Client : 200 OK\n{prediction, model_id, version, request_id}
+
+note over Client, Kafka
+  SLA: p99 ≤100ms (NFR-101).
+  Critical path: WAF→ALB→GW→Inf→GPU≈60-80ms.
+  Cache hit path: WAF→ALB→GW→Inf→Redis≈15-25ms.
+end note
+
+@enduml

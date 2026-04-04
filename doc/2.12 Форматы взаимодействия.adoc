@@ -1,0 +1,481 @@
+=== Форматы взаимодействия
+
+==== Протоколы по типу взаимодействия
+
+.Выбор протокола по границе взаимодействия
+[cols="2,2,1,3"]
+|===
+| Граница | Протокол | Формат | Обоснование
+
+| Клиент → API Gateway (внешний)
+| HTTPS / HTTP/1.1
+| JSON
+| Максимальная совместимость. Клиент — любое приложение или скрипт. JSON читаем, легко отлаживается.
+
+| API Gateway → Inference Service (внутренний)
+| gRPC / HTTP/2
+| Protobuf
+| Критический путь, SLA p99 ≤100ms. Protobuf в 5–10× компактнее JSON. HTTP/2 multiplexing: один TCP-коннект для параллельных запросов. Streaming — задел для FR-103 (LLM, Future).
+
+| API Gateway → Model Service (внутренний)
+| REST / HTTP/1.1
+| JSON
+| Нечастые управляющие операции. REST + JSON: читаем, легко тестировать curl/Postman. Latency не критична.
+
+| API Gateway → Batch Service (внутренний)
+| REST / HTTP/1.1
+| JSON
+| Аналогично Model Service. Submit + status polling — простые CRUD-операции.
+
+| Сервисы → Kafka (события)
+| Kafka binary protocol
+| JSON (события), Avro (Future)
+| Брокер сообщений: нет понятия "ответа". JSON для Baseline — читаем, не требует Schema Registry. Avro + Confluent Schema Registry — в MVP для строгого контракта.
+
+| Сервисы → PostgreSQL
+| PostgreSQL wire protocol
+| SQL
+| Стандарт. TLS в transit.
+
+| Сервисы → Redis
+| Redis Serialization Protocol (RESP3)
+| Binary
+| Низкая latency, бинарный протокол.
+
+| Deployment Service → Kubernetes API
+| HTTPS / HTTP/1.1
+| JSON (Kubernetes objects)
+| Стандартный K8s API. Библиотеки клиентов для Go, Python.
+|===
+
+==== Service Discovery: Kubernetes DNS
+
+В Baseline/Alpha используется встроенный в Kubernetes DNS без внешних зависимостей.
+
+*Соглашение об именовании сервисов:*
+
+[source]
+----
+<service-name>.<namespace>.svc.cluster.local
+
+Примеры:
+  inference-service.ml-platform.svc.cluster.local:50051   (gRPC)
+  model-service.ml-platform.svc.cluster.local:8080         (REST)
+  batch-service.ml-platform.svc.cluster.local:8080         (REST)
+  redis.ml-platform.svc.cluster.local:6379
+  postgres.ml-platform.svc.cluster.local:5432
+----
+
+Kubernetes Service (ClusterIP) обеспечивает балансировку round-robin между подами. Headless Service (`clusterIP: None`) используется для Kafka и PostgreSQL — клиент обходит брокеры напрямую.
+
+*Почему K8s DNS, а не Consul/Eureka:*
+Consul добавляет операционный overhead (отдельный кластер, агенты на каждой ноде) без выигрыша в Baseline с одним кластером. Eureka — JVM-экосистема, не релевантна. K8s DNS — встроен, нулевые затраты на сопровождение.
+
+==== WAF: AWS WAF
+
+WAF стоит первым на пути входящего трафика, перед NLB/ALB, и фильтрует запросы до попадания в кластер.
+
+*Применяемые Managed Rule Groups:*
+
+[cols="2,3"]
+|===
+| Rule Group | Назначение
+
+| `AWSManagedRulesCommonRuleSet`
+| OWASP Top 10: SQL injection, XSS, path traversal, command injection.
+
+| `AWSManagedRulesKnownBadInputsRuleSet`
+| Известные вредоносные паттерны входных данных.
+
+| `AWSManagedRulesAmazonIpReputationList`
+| Блокировка IP-адресов из списков репутации AWS (боты, scanners, TOR exit nodes).
+|===
+
+*Кастомные правила (Baseline):*
+
+[source,json]
+----
+{
+  "Name": "LimitPayloadSize",
+  "Priority": 1,
+  "Statement": {
+    "SizeConstraintStatement": {
+      "FieldToMatch": {"Body": {}},
+      "ComparisonOperator": "GT",
+      "Size": 10485760,
+      "TextTransformations": [{"Priority": 0, "Type": "NONE"}]
+    }
+  },
+  "Action": {"Block": {}},
+  "VisibilityConfig": {
+    "MetricName": "LimitPayloadSize",
+    "SampledRequestsEnabled": true,
+    "CloudWatchMetricsEnabled": true
+  }
+}
+----
+
+NOTE: Payload >10MB блокируется на WAF до достижения кластера. Batch inference данные загружаются напрямую в S3, а не через API Gateway.
+
+==== Rate Limiting: Token Bucket
+
+Rate limiting реализован в API Gateway (Kong/Envoy) на основе алгоритма Token Bucket.
+
+*Почему Token Bucket:*
+
+* *Fixed Window* — граничный эффект: 2× лимита на стыке окон.
+* *Sliding Window* — точнее, но дорого в памяти при большом числе клиентов.
+* *Leaky Bucket* — не допускает burst, неудобно для API (пользователь не может отправить несколько запросов подряд).
+* *Token Bucket* — допускает краткосрочный burst (до размера корзины), но ограничивает среднюю скорость. Правильный trade-off для API.
+
+*Лимиты по плану тенанта:*
+
+[cols="2,1,1,2"]
+|===
+| Уровень | req/min | burst | Счётчик в Redis
+
+| Default (Baseline, 1 тенант)
+| 1000
+| 200
+| `rate_limit:{tenant_id}:{minute}`
+
+| Per API key (детализация)
+| 200
+| 50
+| `rate_limit:{api_key_id}:{minute}`
+|===
+
+При превышении лимита API Gateway возвращает `429 Too Many Requests` с заголовком `Retry-After: 60`.
+
+Счётчик хранится в Redis с атомарным `INCR` + `EXPIRE`. Failover Redis: при недоступности Redis rate limiting деградирует gracefully — запросы пропускаются (fail-open), не блокируются.
+
+==== Версионирование API
+
+Все публичные эндпоинты версионируются через путь URL:
+
+[source]
+----
+/v1/models
+/v1/infer
+/v1/batch/jobs
+
+/v2/models        (будущие breaking changes)
+----
+
+*Правила совместимости:*
+
+* Добавление нового поля в ответ — не breaking change, допускается без смены версии.
+* Удаление поля, изменение типа, изменение семантики — breaking change, требует `/v2/`.
+* `/v1/` и `/v2/` работают одновременно не менее 6 месяцев после выхода `/v2/` (deprecation period).
+* Версия указывается в OpenAPI spec (`info.version`) и заголовке ответа `X-API-Version`.
+
+==== OpenAPI: ключевые эндпоинты
+
+Ниже — иллюстративные контракты для ключевых FR Baseline/Alpha. Полный OpenAPI spec генерируется из кода (FastAPI/Kong) и публикуется автоматически (FR-908).
+
+===== POST /v1/models — Загрузка модели (FR-201)
+
+[source,yaml]
+----
+openapi: "3.0.3"
+info:
+  title: ML Platform API
+  version: "1.0.0"
+paths:
+  /v1/models:
+    post:
+      summary: Зарегистрировать модель в реестре
+      operationId: createModel
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, framework, artifact_url]
+              properties:
+                name:
+                  type: string
+                  example: "fraud-detector-v1"
+                framework:
+                  type: string
+                  enum: [pytorch, tensorflow, onnx]
+                artifact_url:
+                  type: string
+                  format: uri
+                  description: "S3 URI артефакта модели"
+                  example: "s3://ml-platform-artifacts/models/fraud-v1.tar.gz"
+                idempotency_key:
+                  type: string
+                  description: "UUID для идемпотентного повтора"
+      responses:
+        "201":
+          description: Модель зарегистрирована
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelResponse'
+        "401":
+          description: API key недействителен
+        "422":
+          description: Ошибка валидации входных данных
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+  schemas:
+    ModelResponse:
+      type: object
+      properties:
+        model_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        state:
+          type: string
+          enum: [DRAFT, VALIDATING, STAGING, PRODUCTION, DEPRECATED, FAILED]
+        created_at:
+          type: string
+          format: date-time
+----
+
+===== POST /v1/models/{id}/deploy — Запрос развёртывания (FR-301)
+
+[source,yaml]
+----
+  /v1/models/{id}/deploy:
+    post:
+      summary: Запустить конвейер развёртывания
+      operationId: deployModel
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "202":
+          description: Развёртывание запущено асинхронно
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  model_id:
+                    type: string
+                    format: uuid
+                  state:
+                    type: string
+                    example: "VALIDATING"
+                  status_url:
+                    type: string
+                    description: "URL для polling статуса"
+                    example: "/v1/models/abc-123"
+        "404":
+          description: Модель не найдена
+        "409":
+          description: "Модель уже в состоянии VALIDATING или PRODUCTION"
+----
+
+===== POST /v1/infer — Синхронный инференс (FR-101)
+
+[source,yaml]
+----
+  /v1/infer:
+    post:
+      summary: Выполнить предсказание (синхронный)
+      operationId: predict
+      security:
+        - ApiKeyAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model_id, inputs]
+              properties:
+                model_id:
+                  type: string
+                  format: uuid
+                inputs:
+                  type: object
+                  description: "Входные данные в формате, определённом схемой модели"
+                  additionalProperties: true
+      responses:
+        "200":
+          description: Предсказание выполнено
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  prediction:
+                    type: object
+                    additionalProperties: true
+                  model_id:
+                    type: string
+                    format: uuid
+                  model_version:
+                    type: string
+                  request_id:
+                    type: string
+                    format: uuid
+                  latency_ms:
+                    type: integer
+        "503":
+          description: "GPU недоступен (Circuit Breaker OPEN)"
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+              description: "Секунды до повторной попытки"
+        "429":
+          description: "Превышен rate limit"
+          headers:
+            Retry-After:
+              schema:
+                type: integer
+----
+
+===== GET /v1/models/{id} — Статус модели (FR-202)
+
+[source,yaml]
+----
+  /v1/models/{id}:
+    get:
+      summary: Получить статус и метаданные модели
+      operationId: getModel
+      security:
+        - ApiKeyAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Метаданные модели
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelResponse'
+        "404":
+          description: Модель не найдена
+----
+
+==== Protobuf: InferenceService
+
+gRPC используется на внутреннем пути API Gateway → Inference Service. Контракт описывается в `.proto`:
+
+[source,protobuf]
+----
+syntax = "proto3";
+package mlplatform.inference.v1;
+
+option go_package = "github.com/org/ml-platform/gen/inference/v1";
+
+// InferenceService — внутренний gRPC-сервис для выполнения предсказаний.
+// Используется API Gateway для маршрутизации inference-запросов.
+service InferenceService {
+  rpc Predict(PredictRequest) returns (PredictResponse);
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message PredictRequest {
+  string request_id    = 1;  // UUID, генерируется API Gateway
+  string tenant_id     = 2;
+  string model_id      = 3;
+  bytes  inputs_json   = 4;  // JSON-сериализованные входные данные
+  int64  timeout_ms    = 5;  // Таймаут выполнения (default: 5000ms)
+}
+
+message PredictResponse {
+  string request_id    = 1;
+  bytes  outputs_json  = 2;  // JSON-сериализованный результат
+  string model_version = 3;
+  int64  latency_ms    = 4;
+  bool   cache_hit     = 5;
+}
+
+message HealthCheckRequest {
+  string model_id = 1;
+}
+
+message HealthCheckResponse {
+  bool   healthy       = 1;
+  string model_version = 2;
+  string status_detail = 3;
+}
+----
+
+==== Protobuf: Kafka события
+
+Kafka-события в Baseline используют JSON. Структуры ниже — контракты событий, иллюстрирующие схему:
+
+[source,protobuf]
+----
+syntax = "proto3";
+package mlplatform.events.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// DeploymentRequested — событие запроса развёртывания модели.
+// Producer: Model Service → Topic: deploy-events
+// Consumer: Deployment Service
+message DeploymentRequested {
+  string    model_id     = 1;
+  string    tenant_id    = 2;
+  string    version      = 3;
+  string    artifact_url = 4;  // S3 URI артефакта
+  string    framework    = 5;  // pytorch | tensorflow | onnx
+  google.protobuf.Timestamp requested_at = 6;
+}
+
+// DeploymentSucceeded — событие успешного развёртывания.
+// Producer: Deployment Service → Topic: deploy-events
+message DeploymentSucceeded {
+  string    model_id     = 1;
+  string    tenant_id    = 2;
+  string    version      = 3;
+  string    endpoint     = 4;  // внутренний DNS-адрес сервиса
+  google.protobuf.Timestamp deployed_at = 5;
+}
+
+// DeploymentFailed — событие сбоя развёртывания.
+// Producer: Deployment Service → Topic: deploy-events
+message DeploymentFailed {
+  string    model_id      = 1;
+  string    tenant_id     = 2;
+  string    version       = 3;
+  string    failure_stage = 4;  // validation | deploy | health_check
+  string    failure_reason = 5;
+  google.protobuf.Timestamp failed_at = 6;
+}
+
+// InferenceLogged — запись о выполненном предсказании.
+// Producer: Inference Service → Topic: inference-logs
+message InferenceLogged {
+  string request_id    = 1;
+  string tenant_id     = 2;
+  string model_id      = 3;
+  string model_version = 4;
+  int64  latency_ms    = 5;
+  bool   cache_hit     = 6;
+  bool   error         = 7;
+  string error_code    = 8;
+  google.protobuf.Timestamp timestamp = 9;
+}
+----
+
+NOTE: В Baseline/Alpha Kafka-события сериализуются в JSON для простоты отладки. Миграция на Avro + Confluent Schema Registry планируется в MVP при добавлении нескольких consumer групп с независимыми схемами.

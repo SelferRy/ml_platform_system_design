@@ -7,50 +7,84 @@ title Диаграмма контейнеров - Enterprise ML Platform
 
 Person(user, "Пользователь", "DS / MLE / Разработчик")
 
+System_Boundary(edge, "Edge Layer") {
+    Container(waf, "WAF", "AWS WAF", "OWASP Top 10, SQL injection, XSS, DDoS protection. Managed rule groups.")
+    Container(nlb, "Network LB", "AWS NLB", "L4 TCP. Anycast IP. Health check каждые 10s.")
+    Container(alb, "Application LB", "AWS ALB", "L7 HTTP/HTTPS. Path-based routing: /v1/infer → Inference, /v1/models → Model Service.")
+}
+
 System_Boundary(platform, "Enterprise ML Platform") {
-    Container(api_gw, "API Gateway", "Kong/Envoy", "Аутентификация, rate limiting, маршрутизация")
+    Container(api_gw, "API Gateway", "Kong/Envoy", "Аутентификация API-ключей, rate limiting (Token Bucket), маршрутизация, TLS termination")
     Container(web_ui, "Веб-консоль", "React", "UI управления")
 
     Container(model_svc, "Model Service", "Python/FastAPI", "Реестр моделей, управление жизненным циклом")
     Container(inference_svc, "Inference Service", "Python/Triton", "Обслуживание предсказаний, batching")
-    Container(deploy_svc, "Deployment Service", "Go/Temporal", "Оркестрация развёртывания")
+    Container(deploy_svc, "Deployment Service", "Go/Temporal", "Оркестрация развёртывания, FSM переходы")
+    Container(batch_svc, "Batch Service", "Python", "Приём batch-заданий, управление жизненным циклом")
+    Container(batch_workers, "Batch Workers", "Python/KEDA", "Выполнение batch inference. Scale-to-zero по Kafka lag.")
 
-    ContainerDb(pg, "PostgreSQL", "PostgreSQL 15", "Метаданные, конфигурация")
-    ContainerDb(redis, "Redis", "Redis 7", "Кэш, rate limits")
-    ContainerQueue(kafka, "Kafka", "Apache Kafka", "Потоковая передача событий")
-    ContainerDb(s3, "Объектное хранилище", "MinIO/S3", "Артефакты моделей")
+    Container(sd, "Service Discovery", "Kubernetes DNS", "Разрешение имён: <service>.<namespace>.svc.cluster.local. Headless Service для stateful компонентов.")
+
+    ContainerDb(pg, "PostgreSQL", "PostgreSQL 15", "Метаданные моделей, deployments, audit_log, batch_jobs. Multi-AZ.")
+    ContainerDb(redis, "Redis", "Redis 7", "Кэш предсказаний (TTL 5 мин), rate limit counters, auth token cache")
+
+    System_Boundary(kafka_boundary, "Kafka (Apache Kafka / MSK)") {
+        ContainerQueue(kafka_deploy, "deploy-events", "Kafka topic", "События развёртывания. RF=3, retention=7d. CG: deployment-service")
+        ContainerQueue(kafka_batch, "batch-jobs", "Kafka topic", "Задания batch inference. RF=3, retention=3d. CG: batch-workers")
+        ContainerQueue(kafka_logs, "inference-logs", "Kafka topic", "Метрики и логи инференса. RF=3, retention=30d. CG: log-processor")
+    }
+
+    ContainerDb(s3, "Объектное хранилище", "MinIO/S3", "Артефакты моделей, batch input/output. AES-256 SSE.")
 }
 
-System_Ext(gpu_pool, "GPU Pool", "NVIDIA GPU для инференса")
-System_Ext(k8s, "Kubernetes", "Оркестрация контейнеров")
-System_Ext(prometheus, "Prometheus", "Сбор метрик")
+System_Ext(gpu_pool, "GPU Pool", "NVIDIA GPU / Triton Inference Server")
+System_Ext(k8s, "Kubernetes API", "Оркестрация контейнеров")
+System_Ext(prometheus, "Prometheus / VictoriaMetrics", "Сбор и хранение метрик")
 
-' Взаимодействия пользователя
-Rel(user, api_gw, "HTTPS/gRPC")
+' Внешний трафик
+Rel(user, waf, "HTTPS")
+Rel(waf, nlb, "TCP (filtered)")
+Rel(nlb, alb, "TCP → HTTP/HTTPS")
+Rel(alb, api_gw, "HTTPS", "Path-based routing")
 Rel(user, web_ui, "HTTPS")
-Rel(web_ui, api_gw, "API вызовы")
+Rel(web_ui, api_gw, "HTTPS API вызовы")
 
-' Маршрутизация API Gateway
-Rel(api_gw, model_svc, "REST", "Управление моделями")
-Rel(api_gw, inference_svc, "gRPC", "Предсказания")
+' API Gateway маршрутизация
+Rel(api_gw, model_svc, "REST/HTTP", "Управление моделями")
+Rel(api_gw, inference_svc, "gRPC", "Предсказания (критический путь)")
+Rel(api_gw, batch_svc, "REST/HTTP", "Batch-задания")
+Rel(api_gw, redis, "Redis protocol", "Rate limit counters, auth cache")
+
+' Service Discovery
+Rel(api_gw, sd, "DNS lookup", "Разрешение адресов сервисов")
+Rel(inference_svc, sd, "DNS lookup")
+Rel(model_svc, sd, "DNS lookup")
+Rel(deploy_svc, sd, "DNS lookup")
 
 ' Model Service
 Rel(model_svc, pg, "SQL")
-Rel(model_svc, s3, "S3 API")
-Rel(model_svc, kafka, "События")
+Rel(model_svc, s3, "S3 API", "Артефакты моделей")
+Rel(model_svc, kafka_deploy, "produce", "ModelCreated, StateChanged → deploy-events")
 
 ' Inference Service
-Rel(inference_svc, redis, "Кэш")
-Rel(inference_svc, s3, "Загрузка моделей")
-Rel(inference_svc, gpu_pool, "Выполнение")
-Rel(inference_svc, kafka, "Метрики")
+Rel(inference_svc, redis, "Redis protocol", "Кэш предсказаний")
+Rel(inference_svc, s3, "S3 API", "Загрузка артефактов при cold start")
+Rel(inference_svc, gpu_pool, "Triton protocol", "Выполнение модели")
+Rel(inference_svc, kafka_logs, "produce", "InferenceLogged → inference-logs")
 
 ' Deployment Service
-Rel(deploy_svc, kafka, "События")
-Rel(deploy_svc, k8s, "Развёртывание")
-Rel(deploy_svc, pg, "Состояние")
+Rel(deploy_svc, kafka_deploy, "consume", "CG: deployment-service")
+Rel(deploy_svc, k8s, "HTTPS / K8s API", "Создание Deployment, Service, HPA")
+Rel(deploy_svc, pg, "SQL", "Состояние FSM, история развёртываний")
 
-' Внешние
-Rel(inference_svc, prometheus, "Метрики")
+' Batch
+Rel(batch_svc, pg, "SQL", "Метаданные batch_jobs")
+Rel(batch_svc, kafka_batch, "produce", "BatchJobSubmitted → batch-jobs")
+Rel(batch_workers, kafka_batch, "consume", "CG: batch-workers")
+Rel(batch_workers, s3, "S3 API", "Чтение input / запись output")
+Rel(batch_workers, pg, "SQL", "Обновление статуса задания")
+
+' Мониторинг
+Rel(inference_svc, prometheus, "metrics /metrics")
 
 @enduml

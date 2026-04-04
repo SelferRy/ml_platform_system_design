@@ -36,3 +36,16 @@
 . (+) Создан раздел "Реагирование на инциденты": матрица приоритетов P0–P3, runbooks для 5 сценариев (inference down, высокая латентность, PostgreSQL failover, Kafka failure, batch job завис), DR-план для 3 сценариев (AZ failure, region failure, data corruption), chaos engineering план, postmortem процесс — doc/2.10
 . (+) Раскомментированы include для 2.09 и 2.10 в architecture-decision.adoc
 . (+) Каналы алертинга абстрагированы от конкретного мессенджера (Telegram/Slack/MS Teams — на выбор) — doc/2.09, doc/2.10, diagrams/observability.puml
+
+== ДЗ 3
+2025.04.05
+
+. (+) Обновлена диаграмма контейнеров: добавлены WAF (AWS WAF), явный Load Balancer (NLB/ALB), Service Discovery (Kubernetes DNS), Kafka раскрыта до трёх явных топиков (deploy-events, batch-jobs, inference-logs) с consumer groups — diagrams/c4-container.puml → PNG
+. (+) Создан раздел "Схема взаимодействия": принципы sync vs async (таблица с обоснованием по 7 типам операций), расчёт технической нагрузки (декомпозиция 1000 RPS бизнес → ~3150 RPS Redis + ~150 RPS GPU), описание трёх sequence-диаграмм — doc/2.11
+. (+) Создана sequence-диаграмма синхронного инференса: WAF → ALB → API Gateway → Redis auth → rate limit → Inference Service → Redis cache (hit/miss) → GPU/Triton → Kafka fire-and-forget; показаны Circuit Breaker alt и cache hit alt — diagrams/seq-inference-sync.puml → PNG
+. (+) Создана sequence-диаграмма развёртывания модели (event-driven FSM): 202 Accepted → Kafka (deploy-events) → Deployment Service → Kubernetes API → health check loop → FSM переходы; показан автооткат при failure — diagrams/seq-model-deploy.puml → PNG
+. (+) Создана sequence-диаграмма async batch inference: submit → Kafka (batch-jobs) → KEDA Batch Workers → S3 → polling статуса; показаны DLQ при persistent failure и retry с exponential backoff — diagrams/seq-batch-inference.puml → PNG
+. (+) Создан раздел "Форматы взаимодействия": таблица протоколов (REST/gRPC/Kafka/SQL) с обоснованием, Service Discovery (K8s DNS, соглашение именования), WAF правила (OWASP Top 10, Managed Rule Groups), Rate Limiting (Token Bucket, обоснование vs альтернативы), версионирование API (/v1/, /v2/) — doc/2.12
+. (+) Добавлены OpenAPI-контракты для 4 ключевых эндпоинтов: POST /v1/models, POST /v1/models/{id}/deploy, POST /v1/infer, GET /v1/models/{id} — doc/2.12
+. (+) Добавлены Protobuf-схемы: InferenceService.proto (Predict, HealthCheck) и events.proto (DeploymentRequested, DeploymentSucceeded, DeploymentFailed, InferenceLogged) — doc/2.12
+. (+) Раскомментированы include для 2.11 и 2.12 в architecture-decision.adoc

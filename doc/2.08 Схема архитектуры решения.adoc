@@ -214,6 +214,20 @@ Circuit Breaker реализован в Inference Service для защиты о
 | Пропускает 10% запросов; если OK → Closed, иначе → Open снова
 |===
 
+==== CDN-слой
+
+CDN (Content Delivery Network) применяется для раздачи статических ассетов веб-консоли (ML Dashboard). Динамические API-запросы и inference responses через CDN не проходят.
+
+**Поток запроса к веб-консоли**: Пользователь → DNS (CNAME на CloudFront) → CDN edge node → при cache miss: edge node → S3 `ml-static-{region}` → ответ с заголовком `Cache-Control: max-age=31536000, immutable`.
+
+**Почему CDN применяется только для UI**:
+
+* JS/CSS/HTML бандлы с hash в имени файла — статичны, безопасно кэшировать бессрочно
+* Inference responses содержат данные конкретного тенанта — non-cacheable
+* Артефакты моделей (ONNX, weights) загружаются сервисами через presigned S3 URLs с коротким TTL — CDN не участвует
+
+**Инвалидация кэша**: при CI/CD деплое новой версии UI автоматически запускается CloudFront Invalidation API по пути `/*`. Versioned assets (hash в имени) не требуют инвалидации — новое имя файла = новый объект.
+
 ==== Коммуникация компонентов
 
 [cols="2,2,2,2"]
@@ -264,4 +278,19 @@ Circuit Breaker реализован в Inference Service для защиты о
 | Kubernetes API
 | HTTPS
 | Управление подами
+
+| PostgreSQL
+| Debezium
+| WAL logical replication
+| CDC: изменения model_versions и deployments → Kafka топики pg-cdc-*
+
+| CDN (CloudFront)
+| S3 (ml-static)
+| HTTPS (origin fetch)
+| Загрузка статических ассетов при cache miss
+
+| Пользователь (браузер)
+| CDN (CloudFront)
+| HTTPS
+| Статика веб-консоли (JS/CSS/HTML)
 |===

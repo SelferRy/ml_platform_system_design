@@ -231,6 +231,208 @@ CREATE INDEX idx_inference_logs_model ON inference_logs(model_id, timestamp);
 CREATE INDEX idx_inference_logs_deployment ON inference_logs(deployment_id, timestamp);
 ----
 
+==== Partition Management
+
+Таблицы `audit_logs` и `inference_logs` партиционированы по диапазону timestamp (PARTITION BY RANGE). Партиции создаются ежемесячно заранее, чтобы избежать падения INSERT при отсутствии партиции.
+
+===== Создание ежемесячных партиций
+
+[source,sql]
+----
+-- Партиции для audit_logs
+CREATE TABLE audit_logs_2025_01
+    PARTITION OF audit_logs
+    FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+
+CREATE TABLE audit_logs_2025_02
+    PARTITION OF audit_logs
+    FOR VALUES FROM ('2025-02-01') TO ('2025-03-01');
+
+-- Аналогично для inference_logs
+CREATE TABLE inference_logs_2025_01
+    PARTITION OF inference_logs
+    FOR VALUES FROM ('2025-01-01') TO ('2025-02-01');
+----
+
+===== Функция автоматического создания партиций
+
+[source,sql]
+----
+-- Создаёт партицию на следующий месяц (запускается cron-job в начале каждого месяца)
+CREATE OR REPLACE FUNCTION create_next_month_partition(base_table TEXT)
+RETURNS VOID AS $$
+DECLARE
+    next_month DATE := date_trunc('month', NOW()) + INTERVAL '1 month';
+    partition_name TEXT;
+    start_date TEXT;
+    end_date TEXT;
+BEGIN
+    partition_name := base_table || '_' || to_char(next_month, 'YYYY_MM');
+    start_date := to_char(next_month, 'YYYY-MM-DD');
+    end_date := to_char(next_month + INTERVAL '1 month', 'YYYY-MM-DD');
+
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS %I PARTITION OF %I FOR VALUES FROM (%L) TO (%L)',
+        partition_name, base_table, start_date, end_date
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Удаление старых партиций (retention policy)
+-- Вызывается при переводе данных в cold-tier (S3)
+CREATE OR REPLACE FUNCTION drop_old_partition(base_table TEXT, months_to_keep INT DEFAULT 3)
+RETURNS VOID AS $$
+DECLARE
+    cutoff_date DATE := date_trunc('month', NOW()) - (months_to_keep || ' months')::INTERVAL;
+    partition_name TEXT;
+BEGIN
+    partition_name := base_table || '_' || to_char(cutoff_date, 'YYYY_MM');
+    EXECUTE format('DROP TABLE IF EXISTS %I', partition_name);
+END;
+$$ LANGUAGE plpgsql;
+----
+
+NOTE: Перед удалением партиции данные экспортируются в S3 cold-tier (Parquet) через pg_dump или COPY TO. Это обеспечивает compliance-retention без роста PostgreSQL.
+
+==== Ключевые индексы с обоснованием
+
+[cols="3,2,3,2"]
+|===
+| Индекс | Таблица | Обслуживаемый запрос | Тип и обоснование
+
+| `idx_models_tenant`
+`ON models(tenant_id)`
+| models
+| `SELECT * FROM models WHERE tenant_id = $1` — основной фильтр при multi-tenancy
+| B-tree: равенство по UUID, поддерживает ORDER BY
+
+| `idx_model_versions_state`
+`ON model_versions(state)`
+| model_versions
+| `SELECT * FROM model_versions WHERE state = 'production'` — CQRS read path для списка активных моделей
+| B-tree: low cardinality, но важен для partial scan production-версий
+
+| `idx_model_versions_model`
+`ON model_versions(model_id)`
+| model_versions
+| `SELECT * FROM model_versions WHERE model_id = $1 ORDER BY created_at` — версии конкретной модели
+| B-tree: Foreign key lookup, JOIN с models
+
+| `idx_deployments_status`
+`ON deployments(status)`
+| deployments
+| `SELECT * FROM deployments WHERE status IN ('pending', 'deploying')` — polling активных деплоев
+| B-tree: partial index кандидат для `status != 'terminated'`
+
+| `idx_batch_jobs_tenant_status`
+`ON batch_jobs(tenant_id, status)`
+| batch_jobs
+| `SELECT * FROM batch_jobs WHERE tenant_id = $1 AND status = 'running'` — активные задачи тенанта
+| B-tree composite: фильтр по тенанту + статусу в одном индексе
+
+| `idx_audit_logs_resource`
+`ON audit_logs(resource_type, resource_id)`
+| audit_logs
+| `SELECT * FROM audit_logs WHERE resource_type = 'model_version' AND resource_id = $1` — история модели
+| B-tree composite: включает partition pruning по timestamp через composite PK
+
+| `idx_inference_logs_model`
+`ON inference_logs(model_id, timestamp)`
+| inference_logs
+| `SELECT * FROM inference_logs WHERE model_id = $1 AND timestamp > NOW() - INTERVAL '24h'` — latency анализ
+| B-tree composite с timestamp: позволяет range scan + partition pruning
+
+| `idx_api_keys_hash`
+`ON api_keys(key_hash)`
+| api_keys
+| `SELECT * FROM api_keys WHERE key_hash = $1` — аутентификация по API-ключу (hot path)
+| Hash: только равенство, O(1) lookup, нет ORDER BY нужды
+|===
+
+[NOTE]
+====
+`idx_api_keys_hash` — единственный Hash индекс. Применён потому что ключ используется исключительно для точечного поиска при каждом API-запросе; B-tree здесь избыточен.
+
+BRIN индексы не применяются: таблицы партиционированы по timestamp, поэтому partition pruning заменяет BRIN для временных диапазонов.
+====
+
+==== CQRS Read Models (Materialized Views)
+
+Materialized views обслуживают read path CQRS — выдают данные без JOIN-ов по primary таблицам, обновляются при изменении состояния моделей.
+
+===== Активные production-модели
+
+[source,sql]
+----
+-- Read model: активные модели с последней версией и deployment endpoint
+CREATE MATERIALIZED VIEW mv_active_models AS
+SELECT
+    m.id           AS model_id,
+    m.name         AS model_name,
+    m.tenant_id,
+    mv.id          AS version_id,
+    mv.version,
+    mv.state,
+    mv.artifact_uri,
+    mv.framework,
+    d.id           AS deployment_id,
+    d.endpoint_url,
+    d.status       AS deployment_status
+FROM models m
+JOIN model_versions mv ON mv.model_id = m.id
+LEFT JOIN deployments d ON d.model_version_id = mv.id
+WHERE mv.state = 'production';
+
+CREATE UNIQUE INDEX ON mv_active_models(version_id);
+CREATE INDEX ON mv_active_models(tenant_id);
+----
+
+Стратегия обновления: REFRESH MATERIALIZED VIEW CONCURRENTLY через PostgreSQL trigger или LISTEN/NOTIFY при каждом переходе состояния модели в `production` или `deprecated`.
+
+[source,sql]
+----
+-- Trigger для обновления mv_active_models при изменении state
+CREATE OR REPLACE FUNCTION refresh_mv_active_models()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.state IN ('production', 'deprecated') THEN
+        REFRESH MATERIALIZED VIEW CONCURRENTLY mv_active_models;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_refresh_mv_active_models
+AFTER UPDATE OF state ON model_versions
+FOR EACH ROW EXECUTE FUNCTION refresh_mv_active_models();
+----
+
+===== Использование ресурсов по тенанту
+
+[source,sql]
+----
+-- Read model: агрегация использования ресурсов per tenant для billing и quota monitoring
+CREATE MATERIALIZED VIEW mv_tenant_usage AS
+SELECT
+    t.id                                     AS tenant_id,
+    t.name                                   AS tenant_name,
+    COUNT(DISTINCT m.id)                     AS models_count,
+    COUNT(DISTINCT mv.id) FILTER (WHERE mv.state = 'production') AS active_versions,
+    COUNT(DISTINCT d.id)  FILTER (WHERE d.status = 'running')    AS running_deployments,
+    COUNT(bj.id)          FILTER (WHERE bj.status = 'running')   AS active_batch_jobs,
+    t.storage_quota_gb
+FROM tenants t
+LEFT JOIN models m         ON m.tenant_id = t.id
+LEFT JOIN model_versions mv ON mv.model_id = m.id
+LEFT JOIN deployments d    ON d.model_version_id = mv.id
+LEFT JOIN batch_jobs bj    ON bj.tenant_id = t.id
+GROUP BY t.id, t.name, t.storage_quota_gb;
+
+CREATE UNIQUE INDEX ON mv_tenant_usage(tenant_id);
+----
+
+Стратегия обновления: REFRESH MATERIALIZED VIEW CONCURRENTLY по расписанию каждые 5 минут (не real-time — достаточно для billing dashboard).
+
 ==== Границы транзакций
 
 ===== Переход состояния модели

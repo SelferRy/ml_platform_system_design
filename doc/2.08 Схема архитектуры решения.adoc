@@ -264,4 +264,39 @@ Circuit Breaker реализован в Inference Service для защиты о
 | Kubernetes API
 | HTTPS
 | Управление подами
+
+| Deployment Service
+| PostgreSQL
+| SQL
+| Состояние FSM, история развёртываний
+
+| Deployment Service
+| Kafka (deploy-events)
+| Kafka protocol
+| Consume: ModelCreated/StateChanged; produce: DeploymentSucceeded/Failed
+
+| Batch Service
+| PostgreSQL
+| SQL
+| Метаданные batch_jobs
+
+| Batch Service
+| Kafka (batch-jobs)
+| Kafka protocol
+| Produce: BatchJobSubmitted
+
+| Batch Workers
+| Kafka (batch-jobs)
+| Kafka protocol
+| Consume: BatchJobSubmitted (CG: batch-workers)
+
+| Batch Workers
+| S3 / MinIO
+| S3 API
+| Чтение input / запись output результатов
+
+| Batch Workers
+| PostgreSQL
+| SQL
+| Обновление статуса задания (RUNNING → COMPLETED/FAILED)
 |===

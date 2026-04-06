@@ -245,6 +245,12 @@ psql $DATABASE_URL -c "
 | Queue depth > 10 pending deploys
 | Queue depth == 0 за 10 мин
 
+| Batch Service
+| 2
+| 6
+| CPU > 70% или >50 batch jobs в очереди
+| CPU < 30% за 10 мин
+
 | Batch Workers
 | 2
 | 20

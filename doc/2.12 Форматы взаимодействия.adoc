@@ -306,6 +306,13 @@ components:
                 model_id:
                   type: string
                   format: uuid
+                model_version:
+                  type: string
+                  description: >
+                    Версия модели для запроса (FR-104: одновременная поддержка нескольких версий).
+                    Если не указана — используется PRODUCTION-версия по умолчанию.
+                    Формат: semver (например, "1.2.0") или алиас ("latest", "canary").
+                  example: "1.2.0"
                 inputs:
                   type: object
                   description: "Входные данные в формате, определённом схемой модели"
@@ -374,9 +381,9 @@ components:
           description: Модель не найдена
 ----
 
-==== Protobuf: InferenceService
+==== Protobuf: InferenceService (gRPC)
 
-gRPC используется на внутреннем пути API Gateway → Inference Service. Контракт описывается в `.proto`:
+gRPC используется на внутреннем пути API Gateway → Inference Service. Контракт описывается в `.proto` и *действительно компилируется* в бинарную Protobuf-сериализацию — в отличие от Kafka-событий (см. секцию ниже):
 
 [source,protobuf]
 ----
@@ -384,6 +391,8 @@ syntax = "proto3";
 package mlplatform.inference.v1;
 
 option go_package = "github.com/org/ml-platform/gen/inference/v1";
+
+import "google/protobuf/struct.proto";  // google.protobuf.Struct для динамических inputs/outputs
 
 // InferenceService — внутренний gRPC-сервис для выполнения предсказаний.
 // Используется API Gateway для маршрутизации inference-запросов.
@@ -396,13 +405,34 @@ message PredictRequest {
   string request_id    = 1;  // UUID, генерируется API Gateway
   string tenant_id     = 2;
   string model_id      = 3;
-  bytes  inputs_json   = 4;  // JSON-сериализованные входные данные
-  int64  timeout_ms    = 5;  // Таймаут выполнения (default: 5000ms)
+  string model_version = 4;  // Версия модели; пусто = PRODUCTION по умолчанию (FR-104)
+
+  // inputs: google.protobuf.Struct вместо bytes
+  //
+  // Обоснование выбора Struct:
+  //   Каждая модель (fraud-detector, recommender, churn-predictor) имеет
+  //   уникальную схему входных данных. Единая typed-proto-схема невозможна —
+  //   поле inputs специфично для каждой модели.
+  //
+  //   Рассматривались два варианта:
+  //   (a) bytes inputs_json — raw JSON как байты внутри Protobuf.
+  //       Минус: теряется schema-awareness Protobuf, нет валидации типов,
+  //       дополнительный шаг десериализации bytes → JSON на стороне сервиса.
+  //   (b) google.protobuf.Struct — JSON-подобная структура (map<string, Value>),
+  //       нативная в экосистеме Protobuf. Struct сериализуется компактнее bytes
+  //       за счёт Protobuf encoding, поддерживает вложенность, списки, числа,
+  //       булевы значения. Protobuf-библиотека умеет конвертировать Struct ↔ JSON
+  //       без ручного парсинга.
+  //   Выбрано: google.protobuf.Struct как идиоматичное решение.
+  google.protobuf.Struct inputs = 5;
+
+  int64  timeout_ms    = 6;  // Таймаут выполнения (default: 5000ms)
 }
 
 message PredictResponse {
   string request_id    = 1;
-  bytes  outputs_json  = 2;  // JSON-сериализованный результат
+  // outputs: аналогично inputs — google.protobuf.Struct вместо bytes
+  google.protobuf.Struct outputs = 2;
   string model_version = 3;
   int64  latency_ms    = 4;
   bool   cache_hit     = 5;
@@ -419,12 +449,17 @@ message HealthCheckResponse {
 }
 ----
 
-==== Protobuf: Kafka события
+==== Схемы Kafka-событий (JSON в Baseline, Avro в MVP)
 
-Kafka-события в Baseline используют JSON. Структуры ниже — контракты событий, иллюстрирующие схему:
+Kafka-события в Baseline сериализуются в JSON. Структуры ниже описывают контракт полей события в псевдо-proto-нотации — исключительно как способ задокументировать типы и обязательность полей. Эти файлы *не используются* для бинарной сериализации Kafka-сообщений в Baseline; JSON-сериализация не требует `.proto`-компилятора и Schema Registry.
+
+Миграция на binary Avro + Confluent Schema Registry запланирована в MVP при добавлении нескольких consumer-групп с независимыми схемами (см. NOTE ниже).
 
 [source,protobuf]
 ----
+// ВНИМАНИЕ: данный файл — схема-контракт для документирования полей.
+// В Baseline Kafka-события сериализуются в JSON, не в Protobuf.
+// Avro + Schema Registry — в MVP фазе.
 syntax = "proto3";
 package mlplatform.events.v1;
 

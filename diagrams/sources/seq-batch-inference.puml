@@ -52,12 +52,12 @@ loop Обработка записей батчами (chunk_size=500)
 
     alt Transient error (timeout, GPU unavailable)
         note right of Workers
-          Retry с exponential backoff:
+          Retry с exponential backoff (NFR-208, max 3 попытки):
           attempt 1: wait 1s
-          attempt 2: wait 2s
-          attempt 3: wait 4s
-          attempt 4: wait 8s (+jitter)
-          Max attempts: 5
+          attempt 2: wait 2s (+jitter)
+          attempt 3: wait 4s (+jitter)
+          Max attempts: 3
+          После 3 неудач → DLQ (batch-jobs-dlq)
         end note
         Workers -> Workers : retry (exponential backoff + jitter)
     end
@@ -73,7 +73,7 @@ Workers -> Kafka : produce BatchJobCompleted\n{job_id, output_s3_uri, records_pr
 
 alt Превышены все попытки retry (persistent failure)
     note right of Workers
-      После 5 неудачных попыток сообщение
+      После 3 неудачных попыток (NFR-208) сообщение
       направляется в Dead Letter Queue.
       Job FSM: RUNNING → FAILED.
     end note

@@ -45,8 +45,8 @@ System_Ext(prometheus, "Prometheus / VictoriaMetrics", "Сбор и хранен
 Rel(user, waf, "HTTPS")
 Rel(waf, nlb, "TCP (filtered)")
 Rel(nlb, alb, "TCP → HTTP/HTTPS")
-Rel(alb, api_gw, "HTTPS", "Path-based routing")
-Rel(user, web_ui, "HTTPS")
+Rel(alb, api_gw, "HTTPS", "Path-based routing: /v1/infer, /v1/models, /v1/batch")
+Rel(alb, web_ui, "HTTPS", "Path-based routing: /app/*")
 Rel(web_ui, api_gw, "HTTPS API вызовы")
 
 ' API Gateway маршрутизация

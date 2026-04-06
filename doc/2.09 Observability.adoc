@@ -23,8 +23,8 @@ _Исходник: link:diagrams/sources/observability.puml[observability.puml]_
 | Уровень | Компонент | Роль
 
 | Сбор
-| Prometheus Agent
-| Pull-модель: scraping /metrics каждые 15s. Буферизация при network split.
+| VictoriaMetrics Agent (vmagent)
+| Pull-модель: scraping /metrics каждые 15s. Буферизация при network split. Заменяет Prometheus Agent — совместим с PromQL, меньше потребление памяти, нативная интеграция с VictoriaMetrics без remote_write overhead.
 
 | Сбор
 | Fluent Bit
@@ -36,7 +36,7 @@ _Исходник: link:diagrams/sources/observability.puml[observability.puml]_
 
 | Хранение
 | VictoriaMetrics
-| TSDB: 15s гранулярность 90 дней, downsampled 1h агрегаты 1 год (NFR-502). Выбран вместо Prometheus за горизонтальное масштабирование и сжатие 10:1 против Prometheus.
+| TSDB: 15s гранулярность 90 дней, downsampled 1h агрегаты 1 год (NFR-502). Выбран вместо Prometheus за горизонтальное масштабирование и сжатие 10:1 против Prometheus. Стек полностью переведён на VictoriaMetrics: vmagent → VictoriaMetrics → Grafana (PromQL-совместимый datasource).
 
 | Хранение
 | Loki

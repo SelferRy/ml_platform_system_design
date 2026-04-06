@@ -1,0 +1,116 @@
+@startuml seq-batch-inference
+title Async Batch Inference — Enterprise ML Platform (MVP phase)
+
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 5
+
+actor "Клиент" as Client
+participant "API Gateway\n(Kong/Envoy)" as GW
+participant "Batch Service\n(Python)" as Batch
+participant "PostgreSQL" as PG
+participant "Kafka\n(batch-jobs)" as Kafka
+participant "Batch Workers\n(KEDA)" as Workers
+participant "S3\n(Input / Output)" as S3
+participant "Kafka\n(batch-jobs-dlq)" as DLQ
+
+== Отправка batch-задания (FSM: → Submitted → Queued) ==
+
+Client -> GW : POST /v1/batch/jobs\n{model_id, input_s3_uri, output_s3_uri, priority}
+GW -> Batch : REST forward (аутентификация пройдена)
+
+Batch -> PG : INSERT batch_jobs\n(state=SUBMITTED, tenant_id, model_id,\ninput_uri, idempotency_key)
+PG --> Batch : job_id
+
+Batch -> Kafka : produce BatchJobSubmitted\n{job_id, model_id, input_s3_uri,\noutput_s3_uri, tenant_id}
+note right of Kafka
+  Topic: batch-jobs
+  RF=3, retention=3d
+  KEDA ScaledObject: масштабирует
+  Batch Workers по kafka lag
+end note
+
+Batch -> PG : UPDATE state=QUEUED
+Batch --> GW : 202 Accepted {job_id, state: QUEUED}
+GW --> Client : 202 Accepted {job_id}\n(используйте GET /v1/batch/jobs/{id} для статуса)
+
+== Обработка Batch Workers ==
+
+note right of Workers
+  KEDA: scale-from-zero по kafka lag.
+  При lag > 100 — добавляет workers.
+  При lag = 0 — масштабирует до min=1.
+end note
+
+Kafka -> Workers : consume BatchJobSubmitted\n(CG: batch-workers)
+Workers -> PG : UPDATE state=RUNNING
+
+Workers -> S3 : GET input_s3_uri\n(потоковое чтение batch файла)
+S3 --> Workers : input data stream
+
+loop Обработка записей батчами (chunk_size=500)
+    Workers -> Workers : InferenceService.Predict\n(local gRPC, GPU)
+
+    alt Transient error (timeout, GPU unavailable)
+        note right of Workers
+          Retry с exponential backoff:
+          attempt 1: wait 1s
+          attempt 2: wait 2s
+          attempt 3: wait 4s
+          attempt 4: wait 8s (+jitter)
+          Max attempts: 5
+        end note
+        Workers -> Workers : retry (exponential backoff + jitter)
+    end
+end
+
+Workers -> S3 : PUT output_s3_uri\n(результаты predictions)
+S3 --> Workers : OK
+
+Workers -> PG : UPDATE state=COMPLETED,\noutput_s3_uri, completed_at, records_processed
+Workers -> Kafka : produce BatchJobCompleted\n{job_id, output_s3_uri, records_processed}
+
+== Обработка неуспешных заданий (DLQ) ==
+
+alt Превышены все попытки retry (persistent failure)
+    note right of Workers
+      После 5 неудачных попыток сообщение
+      направляется в Dead Letter Queue.
+      Job FSM: RUNNING → FAILED.
+    end note
+    Workers -> DLQ : produce FailedBatchJob\n{job_id, error, attempt_count, last_error}
+    Workers -> PG : UPDATE state=FAILED,\nfailure_reason, failed_at
+
+    note right of DLQ
+      Topic: batch-jobs-dlq
+      Retention=7d.
+      Инженер анализирует и
+      при необходимости reprocesses вручную.
+    end note
+end
+
+== Polling результата клиентом ==
+
+Client -> GW : GET /v1/batch/jobs/{job_id}
+GW -> Batch : REST forward
+Batch -> PG : SELECT state, output_s3_uri,\nrecords_processed WHERE job_id=?
+PG --> Batch : job status
+
+alt state = COMPLETED
+    Batch --> GW : 200 OK\n{state: COMPLETED, output_s3_uri, records_processed}
+    GW --> Client : 200 OK {job details}
+    Client -> S3 : GET output_s3_uri\n(скачать результаты)
+else state = RUNNING / QUEUED
+    Batch --> GW : 200 OK {state: RUNNING, progress_pct}
+    GW --> Client : 200 OK {state: RUNNING}\n(повторить через 30s)
+else state = FAILED
+    Batch --> GW : 200 OK {state: FAILED, failure_reason}
+    GW --> Client : 200 OK {state: FAILED}
+end
+
+note over Client, S3
+  SLA batch: ≤30 мин для light jobs (≤100K записей),
+  ≤2 ч для heavy jobs (до 10M записей) — NFR-108.
+  Polling интервал рекомендован: 30s.
+end note
+
+@enduml

@@ -39,9 +39,9 @@ include::./doc/2.07 Расчеты показателей решения.adoc[]
 
 include::./doc/2.08 Схема архитектуры решения.adoc[]
 
-// include::./doc/2.09 Observability.adoc[]
+include::./doc/2.09 Observability.adoc[]
 
-// include::./doc/2.10 Реагирование на инциденты.adoc[]
+include::./doc/2.10 Реагирование на инциденты.adoc[]
 
 // include::./doc/2.11 Схема взаимодействия.adoc[]
 

@@ -142,6 +142,14 @@
 | Retry / DLQ
 | Повторы с exponential backoff, dead letter queue для batch
 | Устойчивость к transient failures
+
+| Управление секретами (HashiCorp Vault)
+| Централизованное хранилище секретов для всех сервисов: DB credentials, API-ключи, TLS-сертификаты, S3 credentials
+| Dynamic secrets (auto-rotation), встроенный audit log, least-privilege access per service, cloud-agnostic
+
+| mTLS (Baseline: TLS, MVP: mTLS)
+| Аутентификация и шифрование трафика между внутренними сервисами
+| Zero-trust network model; в Baseline K8s NetworkPolicy + TLS достаточен; mTLS (Istio) — extension point MVP при росте числа сервисов
 |===
 
 ==== Ключевые компоненты
@@ -181,4 +189,12 @@
 | Debezium
 | CDC connector: читает PostgreSQL WAL, публикует изменения таблиц в Kafka; используется Deployment Service для реакции на state transitions модели без прямого coupling к Model Service
 | Debezium (Kafka Connect ecosystem)
+
+| HashiCorp Vault
+| Централизованное управление секретами: dynamic credentials для PostgreSQL (TTL 1h), API-ключи, TLS-сертификаты (PKI engine), envelope encryption (Transit engine); Vault Agent Sidecar — инжекция секретов без изменений кода сервисов
+| HashiCorp Vault (HA, 3 реплики в K8s)
+
+| OPA (Open Policy Agent)
+| Policy-as-code для авторизации: rego-правила в Git, тесты в CI; extension point для MVP — в Baseline RBAC enforcement в API Gateway middleware
+| Open Policy Agent (extension point MVP)
 |===

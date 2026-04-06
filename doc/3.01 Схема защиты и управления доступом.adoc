@@ -1,0 +1,352 @@
+=== Схема защиты и управления доступом
+
+ifndef::imagesdir[:imagesdir: {docdir}/../diagrams]
+
+==== Обзор модели безопасности
+
+Безопасность Enterprise ML Platform строится по принципу **Defence in Depth**: несколько независимых слоёв защиты таким образом, что компрометация одного слоя не даёт злоумышленнику полный доступ к системе. Требования к безопасности определены в FR-801–804 и NFR-401–405; риск нарушения безопасности зафиксирован как критический в doc/1.03 (R-05).
+
+===== Модель угроз (Baseline/Alpha)
+
+Для фазы Baseline/Alpha (1 регион, 1–50 тенантов) актуальны три вектора атаки:
+
+[cols="2,2,3"]
+|===
+| Вектор атаки | Поверхность атаки | Контрмеры
+
+| Компрометация API-ключа тенанта
+| API Key в заголовке запроса; утечка из кода клиента или логов
+| HMAC-SHA256 хранение (не plaintext); ротация ключей; аномальный мониторинг spike inference; немедленная инвалидация через Redis TTL override (см. <<_аутентификация>>)
+
+| Утечка артефактов модели из S3
+| S3 bucket с артефактами; IAM credentials сервисов
+| Prefix-based IAM policy per tenant; AES-256 SSE-KMS; Vault Dynamic Secrets для S3 credentials (TTL 1h); аудит S3 access (CloudTrail) (см. <<_изоляция_данных_тенантов>>)
+
+| Эскалация привилегий внутри платформы
+| API запросы с чужим tenant_id; горизонтальный доступ к данным другого тенанта
+| RBAC на уровне API Gateway; PostgreSQL Row-Level Security как последний барьер; автоматический integration test изоляции в CI (см. <<_авторизация_rbac>>)
+|===
+
+image::security-rbac.png[Defence in Depth, width=900]
+
+_Исходник: link:diagrams/sources/security-rbac.puml[security-rbac.puml]_
+
+==== Аутентификация
+
+Для Baseline/Alpha используются два механизма аутентификации в зависимости от типа клиента (FR-801).
+
+image::security-auth-flow.png[Authentication Flow, width=900]
+
+_Исходник: link:diagrams/sources/security-auth-flow.puml[security-auth-flow.puml]_
+
+===== API-ключи (Machine-to-Machine)
+
+Основной механизм для программного доступа: сервисы, batch-скрипты, CI/CD пайплайны.
+
+*Структура ключа*: префикс `mlp_` + 32 байта криптографически случайных данных (base62), итого ~44 символа. Префикс позволяет автоматически обнаруживать утечки ключей в git-репозиториях через secret scanning.
+
+*Хранение* (таблица `api_keys`, DDL в doc/2.14): только HMAC-SHA256 хеш от ключа, salt per key. Plaintext ключ показывается пользователю единственный раз при создании и не хранится в системе.
+
+*Проверка при запросе*:
+
+. API Gateway извлекает ключ из заголовка `Authorization: Bearer mlp_xxx`
+. Вычисляет HMAC-SHA256 и ищет в Redis (hash-кеш, TTL 5 минут)
+. При cache miss — запрос к PostgreSQL для верификации
+. Результат кешируется в Redis на 5 минут (выровнено с максимальным lag ротации)
+
+При отзыве ключа (revoke): флаг `revoked=true` в PostgreSQL + принудительная инвалидация кеша в Redis (SET с TTL=0). RTO инвалидации: <5 минут (NFR-403).
+
+===== OAuth 2.0 / OIDC (Human Users)
+
+Для пользователей через веб-консоль — Authorization Code Flow + PKCE (FR-801).
+
+*Провайдер*: внешний IdP (Keycloak / Okta / Azure AD), описан в doc/2.04. Платформа не хранит пароли пользователей.
+
+*Роль API Gateway*: Resource Server — валидирует JWT без обращения к IdP при каждом запросе.
+
+*Параметры токенов*:
+
+[cols="2,2,3"]
+|===
+| Токен | TTL | Хранение
+
+| Access Token (JWT RS256)
+| 15 минут
+| Только в памяти браузера / клиента
+
+| Refresh Token
+| 7 дней
+| HttpOnly Secure cookie (не доступен JS)
+
+| JWKS cache (публичные ключи IdP)
+| 1 час
+| In-memory в API Gateway
+|===
+
+*JWT validation*: проверяются claims `exp` (истечение), `iss` (издатель), `aud` (аудитория — `mlp-api`), подпись RS256. Публичные ключи IdP получаются через JWKS endpoint и кешируются с TTL 1 час.
+
+===== Обоснование: API Keys + OIDC vs чистый mTLS
+
+Для M2M коммуникации с внешними клиентами API Keys + OIDC выбраны вместо mTLS по следующим причинам:
+
+* mTLS требует PKI-инфраструктуры на стороне каждого клиента — значительный барьер для onboarding для 1–50 тенантов
+* API Keys проще ротировать по инциденту (один API-вызов) vs мультишаговый процесс отзыва сертификата
+* OIDC обеспечивает federation с корпоративными IdP без изменений платформы
+
+mTLS применяется для внутреннего трафика (см. <<_безопасность_передачи_данных>>).
+
+NOTE: SSO (FR-801 в части SSO) — extension point для MVP. Корпоративный IdP через SAML 2.0 / OIDC подключается без изменений в платформе: меняется конфигурация IdP, протокол OIDC остаётся тем же.
+
+==== Авторизация: RBAC
+
+===== Обоснование выбора RBAC vs ABAC
+
+ABAC (Attribute-Based Access Control) обеспечивает более гранулярный контроль (например, "доступ только к своим моделям в своём регионе в рабочее время"), но значительно сложнее в операционном обслуживании: требует policy engine, сложного языка правил и расширенного тестирования.
+
+Для Baseline/Alpha (1–50 тенантов, фиксированные роли) RBAC достаточен: роли предопределены, scope изоляции обеспечивается на уровне данных (RLS). ABAC через OPA (Open Policy Agent) — extension point для MVP при появлении требований типа resource-level fine-grained access.
+
+===== Матрица RBAC
+
+Роли определены в doc/2.03. Enforcement: RBAC Middleware в API Gateway.
+
+[cols="2,1,1,1,1,1,1,1,1"]
+|===
+| Роль | Models R/W/D | Deployments C/R | Inference | Batch Jobs | Metrics | Audit Logs | Users/Keys | Quotas
+
+| Data Scientist
+| own: R/W/— +
+| own: —/R
+| own tenant
+| own: S/R
+| own models
+| —
+| own keys
+| —
+
+| ML Engineer
+| own: R/W/D +
+| own: C/R
+| own tenant
+| own: S/R
+| own models
+| —
+| own keys
+| —
+
+| ML Platform Admin
+| all: R/W/D
+| all: C/R
+| all tenants
+| all: S/R
+| all
+| R
+| Manage
+| Manage
+
+| App Developer
+| R (production)
+| —/R
+| own tenant
+| —
+| own models
+| —
+| own keys
+| —
+
+| SRE
+| R
+| all: —/R
+| —
+| all: —/R
+| all
+| R
+| —
+| R
+
+| Business Client
+| R (own published)
+| —
+| own tenant
+| —/R
+| own
+| —
+| —
+| —
+
+| Product Manager
+| R
+| —/R
+| —
+| —/R
+| all (aggregated)
+| —
+| —
+| R
+|===
+
+Обозначения: R=read, W=write, D=delete, C=create, S=submit; own=только свои объекты, all=все тенанты.
+
+===== Service Roles (внутренние сервисы)
+
+Внутренние сервисы используют Kubernetes ServiceAccount с привязкой к минимальным правам (least privilege):
+
+[cols="2,3"]
+|===
+| Сервис | Права
+
+| Inference Service
+| SELECT на `model_versions` (только чтение); нет доступа к `deployments`, `api_keys`
+
+| Deployment Service
+| SELECT/INSERT/UPDATE на `deployments`; SELECT на `model_versions`
+
+| Model Service
+| Полный CRUD на `models`, `model_versions`; нет доступа к `deployments` других сервисов
+
+| Metrics Collector
+| INSERT на `inference_logs`; нет доступа к `models`
+|===
+
+===== Изменение ролей
+
+Только Admin может изменять назначения ролей через API. Каждое изменение:
+
+. Записывается в audit log (событие `admin.role_change`)
+. Немедленно инвалидирует кеш авторизации в Redis для затронутого пользователя
+. Вступает в силу при следующем запросе (без logout/login)
+
+NOTE: OPA (Open Policy Agent) с policy-as-code (rego-файлы в Git, тесты в CI) — extension point для MVP. В Baseline policy enforcement реализован как middleware в API Gateway.
+
+==== Безопасность передачи данных
+
+Детали протоколов описаны в doc/2.12. Здесь — security-специфика.
+
+===== TLS конфигурация (NFR-401)
+
+* TLS 1.3 (preferred), TLS 1.2 как fallback для legacy-клиентов
+* Cipher suites: только AEAD — AES-128-GCM-SHA256, AES-256-GCM-SHA384, ChaCha20-Poly1305 — обеспечивает Perfect Forward Secrecy
+* HSTS: `Strict-Transport-Security: max-age=63072000; includeSubDomains` на всех HTTPS-ответах API Gateway
+* Certificate pinning: не применяется (публичный API, частая ротация сертификатов cert-manager)
+
+===== Внутренний трафик
+
+gRPC-трафик между сервисами защищён TLS (one-way): сертификаты сервисов выданы cert-manager через Vault PKI engine.
+
+mTLS (mutual authentication) — extension point для MVP. Обоснование: в Baseline все сервисы в одном K8s namespace с NetworkPolicy — изоляция на сетевом уровне достаточна без операционной стоимости полного mTLS mesh (Istio/Linkerd).
+
+===== Шифрование в покое
+
+[cols="2,3,2"]
+|===
+| Данные | Механизм | Привязка к NFR
+
+| Артефакты моделей (S3)
+| AES-256 SSE-KMS; ключи через Vault Transit engine (envelope encryption)
+| NFR-402
+
+| PostgreSQL данные
+| PostgreSQL Transparent Data Encryption (TDE) или AWS RDS encryption at rest
+| NFR-402
+
+| Redis данные
+| Redis in-memory — не шифруется; защита через NetworkPolicy + TLS in transit
+| NFR-401
+
+| Секреты (API-ключи, DB credentials)
+| HashiCorp Vault KV v2 (Shamir's Secret Sharing для unseal)
+| NFR-402, NFR-403
+|===
+
+==== Управление секретами
+
+image::security-secrets-flow.png[Secrets Flow, width=900]
+
+_Исходник: link:diagrams/sources/security-secrets-flow.puml[security-secrets-flow.puml]_
+
+===== Выбор инструмента: Vault vs альтернативы
+
+[cols="2,3,3"]
+|===
+| Вариант | Преимущества | Недостатки / Почему не выбран
+
+| **HashiCorp Vault** (выбран)
+| Dynamic secrets (PG, AWS); встроенный audit log; cloud-agnostic; K8s Auth интеграция; Vault Agent не требует изменений в коде сервисов
+| Дополнительный компонент в инфраструктуре; требует HA-настройки (3 реплики)
+
+| Kubernetes Secrets
+| Встроен в K8s; нет дополнительного компонента
+| base64 (не шифрование); secrets в etcd без шифрования по умолчанию; нет dynamic secrets; нет audit log; нет ротации
+
+| AWS Secrets Manager
+| Managed service; нативная интеграция с AWS IAM
+| Vendor lock-in (привязка к AWS); дополнительная стоимость per-secret; нет dynamic secrets для PostgreSQL
+|===
+
+Vault выбран: cloud-agnostic (не привязывает к AWS), dynamic secrets для PostgreSQL (автоматическая ротация credentials), встроенный audit log доступа к секретам.
+
+===== Схема хранения секретов по типам
+
+[cols="2,2,3"]
+|===
+| Тип секрета | Vault engine | Ротация
+
+| PostgreSQL credentials (сервисы)
+| Dynamic Secrets (database engine)
+| Автоматически каждые 1 час; two-key overlap window 30%
+
+| API-ключи платформы
+| KV v2: `secret/mlplatform/api-keys/`
+| Вручную по запросу или по TTL (настраивается per tenant)
+
+| S3 / IAM credentials
+| AWS Secrets Engine (dynamic IAM) или IRSA (preferred на AWS)
+| Автоматически; IRSA — без явных credentials
+
+| Kafka SSL certificates
+| PKI engine + cert-manager
+| Автоматически за 30 дней до истечения
+
+| Encryption keys (SSE-KMS)
+| Transit engine (envelope encryption)
+| По политике KMS; ключи не покидают Vault
+|===
+
+===== Vault Agent Sidecar
+
+Предпочтительный способ для Baseline: Vault Agent работает как init-контейнер и sidecar, инжектирует секреты как файлы в `/vault/secrets/`. Сервисы читают файлы — не содержат кода работы с Vault API. При ротации Vault Agent обновляет файл; приложение перечитывает через inotify или reload sidecar.
+
+==== Изоляция данных тенантов
+
+Привязка к FR-506 и NFR-405. Механизмы изоляции в Baseline:
+
+[cols="2,3,3"]
+|===
+| Хранилище | Механизм изоляции | Scope
+
+| PostgreSQL
+| Row-Level Security (RLS) по `tenant_id`. Каждый запрос: `SET LOCAL app.tenant_id = :id`. Политики RLS на таблицах `models`, `model_versions`, `deployments`, `api_keys`
+| Последний барьер — работает даже при ошибке в сервисе
+
+| S3
+| Отдельные key-prefixes `s3://bucket/tenants/{tenant_id}/models/`; IAM policy ограничивает доступ по prefix. При BYOB (Bring Your Own Bucket) — отдельный bucket per tenant
+| Изоляция на уровне IAM
+
+| Redis
+| Key-space префиксы `{tenant_id}:inference:cache:*`; `{tenant_id}:rate_limit:*`. Логическая изоляция
+| Физическое разделение (Redis Cluster namespacing) — extension point MVP
+
+| Kafka
+| Shared cluster; Consumer group ACL по `tenant_id`; topic-level ACL (inference-logs: write only для tenant's service account)
+| Логическая изоляция достаточна для Baseline/50 тенантов
+|===
+
+===== Верификация изоляции
+
+Автоматический integration test в CI (привязка к NFR-405):
+
+. Создаёт двух тенантов (A и B) с моделями
+. Выполняет API-запросы от имени тенанта A с попыткой доступа к ресурсам тенанта B
+. Проверяет, что все запросы возвращают 403 Forbidden
+. Запускается при каждом деплое в staging и production
+
+Результат теста — обязательное условие для прохождения деплоя (gate check).

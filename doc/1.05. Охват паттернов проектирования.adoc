@@ -47,7 +47,13 @@
 | **Гео-маршрутизация**
 | FR-1002
 
-| **Аудит / Event Sourcing**
+| **Аудит / Event Sourcing (через CDC + Kafka)**
+| FR-206, FR-803
+
+| **CQRS**
+| NFR-101 (inference latency), FR-108 (кэширование)
+
+| **CDC (Change Data Capture)**
 | FR-206, FR-803
 
 | **RBAC**

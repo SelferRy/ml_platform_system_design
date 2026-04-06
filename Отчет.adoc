@@ -50,3 +50,22 @@
 . (+) Добавлены Protobuf-схемы: InferenceService.proto (Predict, HealthCheck) и events.proto (DeploymentRequested, DeploymentSucceeded, DeploymentFailed, InferenceLogged) — doc/2.12
 . (+) Раскомментированы include для 2.11 и 2.12 в architecture-decision.adoc
 . (+) Каналы алертинга абстрагированы от конкретного мессенджера (Telegram/Slack/MS Teams — на выбор) — doc/2.09, doc/2.10, diagrams/observability.puml
+
+
+== ДЗ 4
+2025.04.05
+
+. (+) Добавлен прогноз роста данных по годам (Y1/Y3/Y5) для S3, PostgreSQL, Kafka, VictoriaMetrics, inference logs — doc/2.07
+. (+) Добавлена классификация данных по температуре (hot/warm/cold) и характеристикам (статичные/модифицируемые), read/write ratio по компонентам, hot/cold split с влиянием на стоимость — doc/2.07
+. (+) Переработан раздел "Система хранения данных": добавлены CAP-анализ (CP для PG, AP для Redis/Kafka/S3/VictoriaMetrics с обоснованием), стратегия шардирования (Baseline без шардирования + порог и стратегия для MVP), HA и репликация по каждому хранилищу (PG Multi-AZ, Redis Sentinel, Kafka RF=3/min.ISR=2, S3 versioning) — doc/2.13
+. (+) Добавлены CQRS два уровня: Redis read path для инференса (cache hit без PG) и PostgreSQL read replica для UI/API; materialized view mv_active_models на CQRS read model — doc/2.13
+. (+) Описан CDC через Debezium: WAL → Kafka топики pg-cdc-model-versions, pg-cdc-deployments; обоснование (decoupling, надёжность, replay); пометка "extension point для MVP" — doc/2.13
+. (+) Описан CDN слой: CloudFront для статики веб-консоли (JS/CSS/HTML); Cache-Control immutable; инвалидация при деплое UI; явно указано что inference/API/артефакты через CDN не идут — doc/2.13
+. (+) Добавлены Backup таблица (PG RDS snapshot + WAL archiving RPO<5мин, S3 versioning, Redis RDB, Kafka retention, VictoriaMetrics → S3) и таблица ограничений по хранилищам — doc/2.13
+. (+) Добавлены Partition Management: SQL-функции создания ежемесячных партиций и автоматического удаления старых с экспортом в S3 — doc/2.14
+. (+) Добавлены ключевые индексы с обоснованием (8 индексов: B-tree composite, Hash для api_keys, обоснование vs BRIN) — doc/2.14
+. (+) Добавлены CQRS Read Models: materialized view mv_active_models (production-модели с endpoint) + trigger для REFRESH CONCURRENTLY; mv_tenant_usage (агрегация ресурсов per tenant) — doc/2.14
+. (+) Детализирован CQRS паттерн в таблице паттернов: два уровня + read replica; добавлен CDC паттерн как самостоятельная строка; добавлены CDN и Debezium в таблицу ключевых компонентов — doc/2.02
+. (+) Обновлена диаграмма контейнеров: добавлены CDN (CloudFront), S3 Static bucket, Debezium connector, Kafka CDC топики (pg-cdc-model-versions, pg-cdc-deployments) — diagrams/c4-container.puml → PNG
+. (+) Добавлен раздел CDN-слой в схему архитектуры: поток запроса к UI, обоснование применения только для статики, механизм инвалидации; обновлена таблица коммуникации компонентов (Debezium WAL, CDN origin fetch) — doc/2.08
+. (+) Добавлена секция "Метрики хранилищ" в Observability: 7 метрик (Redis hit rate, Redis memory, PG replication lag, PG connections, Kafka consumer lag, S3 errors, Debezium CDC lag) с порогами P1/P2 — doc/2.09

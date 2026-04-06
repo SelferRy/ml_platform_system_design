@@ -8,6 +8,7 @@ title Диаграмма контейнеров - Enterprise ML Platform
 Person(user, "Пользователь", "DS / MLE / Разработчик")
 
 System_Boundary(edge, "Edge Layer") {
+    Container(cdn, "CDN", "AWS CloudFront", "Раздача статики веб-консоли (JS/CSS/HTML). Origin: S3 ml-static. Cache-Control: immutable для versioned assets.")
     Container(waf, "WAF", "AWS WAF", "OWASP Top 10, SQL injection, XSS, DDoS protection. Managed rule groups.")
     Container(nlb, "Network LB", "AWS NLB", "L4 TCP. Anycast IP. Health check каждые 10s.")
     Container(alb, "Application LB", "AWS ALB", "L7 HTTP/HTTPS. Path-based routing: /v1/infer → Inference, /v1/models → Model Service.")
@@ -35,6 +36,14 @@ System_Boundary(platform, "Enterprise ML Platform") {
     }
 
     ContainerDb(s3, "Объектное хранилище", "MinIO/S3", "Артефакты моделей, batch input/output. AES-256 SSE.")
+    ContainerDb(s3_static, "S3 Static", "AWS S3", "Статика веб-консоли (JS/CSS/HTML/fonts). CDN origin bucket.")
+
+    Container(debezium, "Debezium", "Kafka Connect / Debezium", "CDC connector: читает PostgreSQL WAL, публикует изменения model_versions и deployments в Kafka pg-cdc-* топики.")
+
+    System_Boundary(kafka_cdc_boundary, "Kafka CDC Topics") {
+        ContainerQueue(kafka_cdc_models, "pg-cdc-model-versions", "Kafka topic", "CDC: изменения статусов model_versions. RF=3.")
+        ContainerQueue(kafka_cdc_deploys, "pg-cdc-deployments", "Kafka topic", "CDC: изменения статусов deployments. RF=3.")
+    }
 }
 
 System_Ext(gpu_pool, "GPU Pool", "NVIDIA GPU / Triton Inference Server")
@@ -42,7 +51,9 @@ System_Ext(k8s, "Kubernetes API", "Оркестрация контейнеров
 System_Ext(prometheus, "Prometheus / VictoriaMetrics", "Сбор и хранение метрик")
 
 ' Внешний трафик
-Rel(user, waf, "HTTPS")
+Rel(user, cdn, "HTTPS", "Статика веб-консоли")
+Rel(cdn, s3_static, "HTTPS (origin fetch)", "При cache miss")
+Rel(user, waf, "HTTPS", "API и динамические запросы")
 Rel(waf, nlb, "TCP (filtered)")
 Rel(nlb, alb, "TCP → HTTP/HTTPS")
 Rel(alb, api_gw, "HTTPS", "Path-based routing")
@@ -83,6 +94,12 @@ Rel(batch_svc, kafka_batch, "produce", "BatchJobSubmitted → batch-jobs")
 Rel(batch_workers, kafka_batch, "consume", "CG: batch-workers")
 Rel(batch_workers, s3, "S3 API", "Чтение input / запись output")
 Rel(batch_workers, pg, "SQL", "Обновление статуса задания")
+
+' CDC
+Rel(pg, debezium, "WAL logical replication", "Изменения model_versions, deployments")
+Rel(debezium, kafka_cdc_models, "produce", "CDC events: model_versions")
+Rel(debezium, kafka_cdc_deploys, "produce", "CDC events: deployments")
+Rel(deploy_svc, kafka_cdc_models, "consume", "CG: cdc-deployment-service")
 
 ' Мониторинг
 Rel(inference_svc, prometheus, "metrics /metrics")

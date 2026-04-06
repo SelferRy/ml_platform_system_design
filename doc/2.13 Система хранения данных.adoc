@@ -1,3 +1,4 @@
+ifndef::imagesdir[:imagesdir: ../diagrams]
 === Система хранения данных
 
 ==== Стратегия хранения
@@ -24,7 +25,7 @@
 | События / Аудит
 | Log / Stream
 | Kafka → PostgreSQL
-| Event sourcing, возможность replay, развязка
+| Развязка компонентов, возможность replay, CDC-ready
 
 | Метрики
 | Time-Series
@@ -35,6 +36,11 @@
 | Объектное хранилище
 | S3 (клиента или платформы)
 | Hybrid: BYOB для enterprise, managed storage для self-service
+
+| Статика веб-консоли
+| CDN
+| AWS CloudFront / Cloudflare
+| Раздача JS/CSS/HTML с edge-узлов, снижение латентности до UI
 |===
 
 ==== Организация S3 Buckets
@@ -52,8 +58,8 @@
 
 | `ml-models-{region}`
 | Артефакты моделей (weights, configs)
-| До deprecation + 90 дней
-| Per-tenant prefix
+| До deprecation + 90 дней → Glacier
+| Per-tenant prefix `tenant-{id}/`
 
 | `ml-batch-input-{region}`
 | Входные данные batch jobs (managed mode)
@@ -67,8 +73,13 @@
 
 | `ml-logs-{region}`
 | Inference logs, audit exports
-| 30 дней hot → 1 год cold
+| 30 дней hot → 1 год cold (Standard-IA) → Glacier
 | Per-tenant prefix
+
+| `ml-static-{region}`
+| Статика веб-консоли (JS/CSS/HTML/fonts)
+| Без ограничения (versioned assets)
+| Нет (публичный, CDN origin)
 |===
 
 ===== BYOB Mode (Enterprise)
@@ -99,58 +110,402 @@ Response: { "input_id": "inp_abc123", "uri": "s3://ml-batch-input-eu/tenant-42/i
 
 **Ограничения**: Max 10GB per file, storage quota per tenant.
 
-==== Требования консистентности
+==== CAP-анализ по компонентам
 
-===== Уровни консистентности по компонентам
+Распределённые системы не могут одновременно гарантировать Consistency, Availability и Partition Tolerance (теорема CAP). Ниже — осознанный выбор позиции для каждого хранилища платформы.
+
+[cols="2,2,3,3"]
+|===
+| Компонент | CAP-позиция | Обоснование | Практическое следствие
+
+| PostgreSQL (Multi-AZ)
+| CP
+| Synchronous replication primary↔replica-1: при network partition primary остаётся источником истины, replica-1 — read-only. Write failures видны клиенту явно (5xx).
+| При partition: writes продолжаются на primary, reads с replica могут быть недоступны. RPO=0 для sync replica.
+
+| Redis (ElastiCache Sentinel)
+| AP (split-brain risk)
+| Sentinel может выбрать нового primary пока старый жив при медленной сети. Митигация: min quorum = 2 из 3 sentinel нод.
+| Кратковременный split-brain допустим — Redis является кэшем, не источником истины. Данные восстанавливаются из PostgreSQL.
+
+| Kafka
+| AP
+| Partitioned broker продолжает принимать writes при network split. min.ISR=2 при RF=3 балансирует между Availability и Consistency.
+| При потере 1 брокера: продолжает работать. При потере 2 — write блокируется (min.ISR не набирается). Это допустимо.
+
+| S3
+| AP (strong consistency для новых PUT)
+| AWS S3 гарантирует strong consistency для new object writes, eventual consistency для overwrite/delete.
+| Новые артефакты моделей — strong consistency (безопасно). Обновления метаданных объектов — eventual (редкий сценарий).
+
+| VictoriaMetrics
+| AP
+| Метрики — eventual по природе. Небольшая задержка (≤15s) допустима для мониторинга.
+| Алерты могут срабатывать с задержкой до 15s. Для SLO monitoring это приемлемо.
+|===
+
+==== Шардирование
+
+===== Baseline (текущая фаза)
+
+Шардирование PostgreSQL не требуется. 1 primary + 2 реплики покрывают 10K RPS инференса и до 50 тенантов. Пороги для введения шардирования определены в расчётах (doc/2.07):
+
+* >50 000 RPS sustained → шардирование PG по `tenant_id`
+* >100 активных тенантов → переход к выделенным namespace-pool
+
+===== Стратегия шардирования для MVP/Future
+
+**PostgreSQL** — шардирование по `tenant_id` (hash sharding):
+
+* Ключ шардирования: `tenant_id` — все критические запросы scoped к тенанту
+* Инструмент: Citus (расширение PG) или routing на уровне приложения через pg_partman
+* Преимущество: полная изоляция данных тенантов, предсказуемое распределение нагрузки
+
+**Kafka** — уже шардируется партициями по `tenant_id` для inference-events:
+
+* Текущее число партиций: 12 (параллелизм consumer groups)
+* Увеличение партиций при росте consumer groups (>6 consumer instances)
+
+[NOTE]
+====
+Нельзя уменьшить число партиций Kafka без полного пересоздания топика. Начальное число 12 выбрано с запасом.
+====
+
+**S3** — нативное шардирование через prefix:
+
+* Структура: `tenant-{id}/{artifact-type}/{version}/`
+* S3 горизонтально масштабирует throughput по prefix автоматически (>3500 PUT/s и >5500 GET/s per prefix)
+
+==== HA и репликация
+
+===== PostgreSQL
+
+[cols="2,4"]
+|===
+| Параметр | Конфигурация
+
+| Топология
+| 1 primary (AZ-A) + 1 sync replica (AZ-B) + 1 async replica (AZ-C, read-only)
+
+| Sync replica
+| RPO=0 — нет потери данных при AZ-A failure; write подтверждён только после записи на обе ноды
+
+| Async replica (AZ-C)
+| Read queries (аналитика, reporting, UI model list); допускает задержку до нескольких секунд
+
+| Failover
+| RDS Multi-AZ automatic failover; RTO < 60s при AZ failure
+
+| Connection pooling
+| pgBouncer перед primary: max 1000 server connections; режим transaction pooling
+|===
+
+===== Redis (ElastiCache)
+
+[cols="2,4"]
+|===
+| Параметр | Конфигурация
+
+| Топология
+| 1 primary (AZ-A) + 1 replica (AZ-B)
+
+| Failover
+| Sentinel: автоматический failover ≤30s при недоступности primary
+
+| При failover
+| Кратковременный cache miss burst → inference latency растёт, но данные не теряются (Redis — кэш, не источник истины); PostgreSQL выступает fallback
+
+| Persistence
+| RDB snapshot каждые 30 мин (кэш — не критичные данные); AOF отключён для производительности
+|===
+
+===== Kafka
+
+[cols="2,4"]
+|===
+| Параметр | Конфигурация
+
+| Топология
+| 3 брокера (по одному на AZ), Replication Factor=3, min.ISR=2
+
+| Гарантия записи
+| Запись подтверждена при репликации на 2 из 3 брокеров
+
+| Устойчивость
+| При потере 1 брокера — продолжает работать. При потере 2 — write блокируется
+
+| Координация
+| ZooKeeper / KRaft кластер из 3 нод
+|===
+
+===== S3
+
+[cols="2,4"]
+|===
+| Параметр | Конфигурация
+
+| Надёжность
+| Нативная AWS репликация: 11 девяток (99.999999999%) durability
+
+| Versioning
+| Включён для `ml-models-{region}`: артефакты хранятся 90 дней после deprecation
+
+| Cross-region replication
+| Будущая фаза (DR для region failure). В Baseline — warm standby через PG async replica
+|===
+
+==== CQRS для инференса
+
+CQRS (Command Query Responsibility Segregation) применяется на двух уровнях для оптимизации критического пути инференса (NFR-101: latency ≤100ms p99).
+
+===== Уровень 1 — Разделение путей (inference hot path)
+
+Структура компонентов и потоков данных (write path и read path):
+
+image::cqrs-component.png[CQRS Component Diagram, width=800]
+
+Временная последовательность вызовов (sequence diagram):
+
+image::cqrs-data-flow.png[CQRS Data Flow, width=700]
+
+[cols="2,4"]
+|===
+| Путь | Маршрут
+
+| Write path
+| API Gateway → Inference Service → Redis (cache write при miss) → Kafka (fire-and-forget log)
+
+| Read path (cache hit)
+| API Gateway → Inference Service → Redis (cache read hit) → ответ без обращения к PostgreSQL
+|===
+
+Redis hit rate target: >80% (метрика `mlp_redis_cache_hit_rate`). При hit rate <50% sustained 1 час — P2 алерт (ревизия TTL стратегии или pre-warming).
+
+===== Уровень 2 — Разделение read replicas (model registry)
+
+[cols="2,4"]
+|===
+| Путь | Маршрут
+
+| Write path
+| Model Service → PostgreSQL primary (ACID transitions, lifecycle)
+
+| Read path
+| UI/API list queries → PostgreSQL async replica (AZ-C); eventual consistency допустима — метаданные меняются редко
+|===
+
+Materialized view `mv_active_models` (описан в doc/2.14) обслуживает read path для списка production-моделей без JOIN-ов по primary.
+
+==== CDC (Change Data Capture)
+
+CDC позволяет реагировать на изменения в PostgreSQL без явного coupling между сервисами.
+
+===== Механизм
+
+. Debezium connector подключается к PostgreSQL WAL (Write-Ahead Log) через logical replication slot
+. Изменения строк в таблицах `model_versions`, `deployments` публикуются в Kafka топики
+. Consumer-сервисы подписываются на CDC топики и реагируют асинхронно
+
+[source,json]
+----
+// Пример CDC события в pg-cdc-model-versions
+{
+  "before": { "id": "mv-123", "state": "staging" },
+  "after":  { "id": "mv-123", "state": "production" },
+  "op": "u",
+  "ts_ms": 1712345678000,
+  "source": { "table": "model_versions" }
+}
+----
+
+===== CDC топики
+
+[cols="2,3,2"]
+|===
+| Топик | Содержимое | Consumer
+
+| `pg-cdc-model-versions`
+| Изменения статусов моделей (INSERT/UPDATE)
+| Deployment Service (реагирует на state → production)
+
+| `pg-cdc-deployments`
+| Изменения статусов развёртываний
+| Notification Service, Metrics Collector
+|===
+
+===== Обоснование CDC vs прямой вызов
+
+[cols="2,3"]
+|===
+| Преимущество | Объяснение
+
+| Decoupling
+| Model Service не знает о Deployment Service — уменьшает coupling
+
+| Надёжность
+| WAL-based CDC гарантирует доставку даже при временной недоступности consumer
+
+| Replay
+| Можно воспроизвести историю изменений для отладки или восстановления read model
+|===
+
+[NOTE]
+====
+В Baseline достаточно explicit Kafka publish из Model Service при переходах состояния. CDC через Debezium — extension point для MVP, когда число downstream consumers вырастет и explicit coupling станет проблемой. Debezium добавляет операционную сложность (logical replication slot, connector management).
+====
+
+==== CDN
+
+CDN применяется только для статики веб-консоли (ML Dashboard).
+
+===== Конфигурация
+
+[cols="2,3"]
+|===
+| Параметр | Значение
+
+| Поставщик
+| AWS CloudFront (если AWS) или Cloudflare CDN
+
+| Origin
+| S3 bucket `ml-static-{region}`
+
+| Контент
+| JS/CSS/HTML бандлы, иконки, шрифты, статические ассеты
+
+| Cache-Control
+| `max-age=31536000, immutable` для versioned ассетов (hash в имени файла)
+
+| Invalidation
+| При деплое новой версии UI — CloudFront Invalidation API по пути `/*`
+|===
+
+===== Что НЕ кэшируется через CDN
+
+* Inference responses — персонализированы, non-cacheable
+* API ответы — динамические, содержат состояние тенанта
+* Артефакты моделей (ONNX, PyTorch weights) — загружаются сервисами напрямую из S3 через presigned URLs, не через CDN
+
+==== Backup и резервирование
+
+[cols="2,2,2,2,2,2"]
+|===
+| Хранилище | Тип бэкапа | Частота | Retention | RTO | RPO
+
+| PostgreSQL
+| RDS automated snapshot + WAL archiving
+| Snapshot ежедневно, WAL continuous
+| 7 дней
+| <1h
+| <5 мин
+
+| PostgreSQL (долгосрочный)
+| Manual snapshot
+| Еженедельно
+| 90 дней
+| <2h
+| —
+
+| S3 артефакты
+| Versioning enabled
+| Continuous (при каждом PUT)
+| Версии 90 дней после deprecation
+| N/A
+| N/A
+
+| S3 артефакты (кросс-регион)
+| CRR (Cross-Region Replication)
+| Async
+| Зеркало региона
+| <1h после failure
+| <мин
+
+| Redis
+| RDB snapshot (AOF отключён — кэш)
+| Каждые 30 мин
+| 1 день
+| Cold start (rebuild из PG)
+| N/A (кэш)
+
+| Kafka
+| Retention 7 дней (rolling)
+| Rolling
+| 7 дней
+| N/A
+| Offset-based replay
+
+| VictoriaMetrics
+| vmagent remote_write → S3
+| Continuous
+| 1 год
+| <30 мин
+| <15 мин
+|===
+
+NOTE: PostgreSQL async replica (AZ-C) используется как warm standby для региональной DR. Cross-region replication — будущая фаза.
+
+==== Обоснование применимости решений
+
+Данная секция сводит обоснования ключевых архитектурных решений в одном месте. Подробности — в соответствующих секциях выше.
+
+===== Redis кэш
+
+Redis обоснован высоким read/write ratio на inference hot path и жёстким SLO (NFR-101: latency ≤100ms p99):
+
+* Inference-запросы для одних и тех же входных данных повторяются (feature vectors от одного тенанта); ожидаемый hit rate >80% снимает нагрузку с PostgreSQL primary.
+* Redis отвечает за sub-ms latency на cache hit, тогда как SELECT к PostgreSQL добавляет 5–20ms.
+* Redis — кэш, не источник истины: при split-brain или failover данные восстанавливаются из PostgreSQL (см. <<_cap_анализ_по_компонентам, CAP-анализ>> и <<_redis_elasticache, HA Redis>>).
+
+===== Шардирование PostgreSQL отложено
+
+Шардирование PostgreSQL не введено в Baseline — текущая нагрузка (≤10K RPS, ≤50 тенантов) покрывается топологией 1 primary + 2 реплики. Пороги введения шардирования (см. <<_шардирование, раздел Шардирование>>):
+
+* >50 000 RPS sustained → шардирование PG по `tenant_id` (Citus / pg_partman)
+* >100 активных тенантов → переход к выделенным namespace-pool
+
+До достижения порогов шардирование создаёт операционную сложность без выгоды. Kafka уже шардирована партициями по `tenant_id`; S3 масштабирует throughput по prefix автоматически.
+
+===== Консистентность данных
+
+CAP-позиция каждого компонента выбрана осознанно (подробно — <<_cap_анализ_по_компонентам, CAP-анализ>>):
 
 [cols="2,2,3"]
 |===
-| Компонент | Консистентность | Обоснование
+| Компонент | CAP-позиция | Следствие для консистентности
 
-| Model Registry (PostgreSQL)
-| Строгая
-| Изменения состояния модели должны быть немедленно видны; ACID требуется для переходов жизненного цикла
+| PostgreSQL (primary)
+| CP
+| Synchronous replication primary↔replica-1: RPO=0, write подтверждён на двух нодах. Источник истины для всех сервисов.
 
-| Кэш предсказаний (Redis)
+| PostgreSQL (read replica AZ-C)
 | Eventual
-| Устаревшие предсказания допустимы при коротком TTL; производительность важнее консистентности
+| Async replica допускает задержку нескольких секунд — допустимо для UI/reporting; inference hot path не использует.
 
-| Аудит-лог
-| Eventual
-| Асинхронная запись через Kafka допустима; логи могут иметь небольшую задержку
+| Redis
+| AP (кэш)
+| Split-brain допустим: Redis не источник истины. Данные восстанавливаются из PG при любом расхождении.
 
-| Метрики (Prometheus)
-| Eventual
-| Time-series данные по своей природе eventual; задержка ~10s допустима
-
-| Состояние развёртывания
-| Строгая
-| Состояние K8s должно соответствовать реестру; транзакции для изменений состояния
+| Kafka
+| AP
+| min.ISR=2 при RF=3 балансирует доступность и durability. Inference logs — eventually consistent по природе.
 |===
 
-==== Политики хранения данных
+==== Ограничения выбранных решений
 
-[cols="2,2,2,2"]
-|===
-| Тип данных | Горячее хранение | Холодное хранение | Архив
+===== PostgreSQL
 
-| Артефакты моделей
-| Бессрочно (пока активна)
-| 90 дней после deprecation
-| 1 год (S3 Glacier)
+* Вертикальный потолок: ~32 vCPU, 256 GB RAM (RDS db.r6g.8xlarge)
+* Connection limit: pgBouncer ограничен ~1000 server connections к primary
+* Write scalability: единственный primary — вертикальный bottleneck до момента шардирования
 
-| Логи инференса
-| 7 дней
-| 30 дней (агрегированные)
-| 1 год (комплаенс)
+===== Redis
 
-| Аудит-логи
-| 30 дней
-| 1 год
-| 7 лет (комплаенс)
+* Не персистентное хранилище для критических данных — только кэш
+* Cluster mode (шардирование) не включён в Baseline; порог: >8 GB используемой памяти sustained
+* При failover: cache miss burst на 30–60s → временный рост latency inference
 
-| Метрики
-| 15 дней (сырые)
-| 1 год (downsampled)
-| Н/Д
-|===
+===== Kafka
+
+* Нельзя уменьшить число партиций без полного пересоздания топика — начальное число выбирается с запасом
+* min.ISR=2 при 3 брокерах: потеря 2 брокеров блокирует writes до восстановления
+* Debezium (CDC) требует настройки logical replication slot в PostgreSQL — дополнительная операционная нагрузка

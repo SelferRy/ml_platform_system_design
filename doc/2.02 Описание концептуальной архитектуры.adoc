@@ -71,9 +71,13 @@
 | Zero-downtime развёртывание новых версий
 | Мгновенный откат при проблемах
 
-| CQRS (частичный)
-| Раздельные пути чтения/записи для инференса vs управления
-| Оптимизация пути инференса для низкой латентности
+| CQRS
+| Два уровня: (1) Redis read path для инференса — предсказания без обращения к PG при cache hit; (2) PostgreSQL read replica (AZ-C) для UI/API list-запросов — writes только на primary
+| NFR-101: inference latency ≤100ms p99 достигается за счёт Redis hit на критическом пути; read replica снижает нагрузку на primary
+
+| CDC (Change Data Capture)
+| Debezium читает PostgreSQL WAL и публикует изменения `model_versions` и `deployments` в Kafka топики `pg-cdc-model-versions`, `pg-cdc-deployments`
+| Decoupling: Model Service не знает о Deployment Service; надёжность WAL-based доставки; возможность replay истории изменений. В Baseline — explicit Kafka publish; CDC — extension point для MVP
 
 | Saga (Orchestration)
 | Транзакционный контроль квот в биллинге, workflow развёртывания через Temporal
@@ -169,4 +173,12 @@
 | Event Bus
 | Асинхронная коммуникация между сервисами
 | Apache Kafka
+
+| CDN
+| Раздача статических ассетов веб-консоли (JS/CSS/HTML/fonts) с edge-узлов; origin — S3 bucket `ml-static-{region}`
+| AWS CloudFront / Cloudflare CDN
+
+| Debezium
+| CDC connector: читает PostgreSQL WAL, публикует изменения таблиц в Kafka; используется Deployment Service для реакции на state transitions модели без прямого coupling к Model Service
+| Debezium (Kafka Connect ecosystem)
 |===

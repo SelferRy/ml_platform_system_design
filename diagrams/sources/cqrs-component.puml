@@ -1,0 +1,94 @@
+@startuml cqrs-component
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam linetype ortho
+
+skinparam package {
+    BackgroundColor #F8F9FA
+    BorderColor #AAAAAA
+    FontColor #333333
+    FontStyle bold
+}
+
+skinparam component {
+    BackgroundColor #E8F4FD
+    BorderColor #2980B9
+    FontColor #1A1A1A
+}
+
+skinparam database {
+    BackgroundColor #FEF9E7
+    BorderColor #F39C12
+    FontColor #1A1A1A
+}
+
+skinparam queue {
+    BackgroundColor #F9EBEA
+    BorderColor #C0392B
+    FontColor #1A1A1A
+}
+
+skinparam ArrowColor #555555
+skinparam ArrowThickness 1.5
+
+title CQRS Component Diagram — ML Platform
+
+' ─── Уровень 1: Inference CQRS ───────────────────────────────────
+
+package "Inference CQRS (Level 1)" {
+
+    package "Write Path (cache MISS)" #FFF3E0 {
+        component "[1] Inference Service\n(MISS branch)" as infsvc_w
+        database "[3] PostgreSQL Primary" as pg_w
+        database "[4] Redis Cache\n← SET key TTL=300s" as redis_w
+        queue "[5] Kafka inference-logs\n(fire-and-forget)" as kafka_w
+    }
+
+    package "Read Path (cache HIT)" #E8F8F5 {
+        component "[1] Inference Service\n(HIT branch)" as infsvc_r
+        database "[2] Redis Cache\n→ GET key HIT" as redis_r
+    }
+}
+
+' ─── Уровень 2: Model Registry CQRS ─────────────────────────────
+
+package "Model Registry CQRS (Level 2)" {
+
+    package "Write Path" #FFF3E0 {
+        component "Model Service" as modelsvc
+        database "PostgreSQL Primary" as pg_m
+    }
+
+    package "Read Path" #E8F8F5 {
+        database "PostgreSQL Replica\n(async, AZ-C)" as pg_r
+        component "UI / API Queries" as ui
+    }
+}
+
+' ─── Common entry point ──────────────────────────────────────────
+
+actor "Client" as client
+component "API Gateway" as gw
+
+client --> gw
+gw --> infsvc_w : [MISS]
+gw --> infsvc_r : [HIT]
+
+' Write path flows
+infsvc_w --> pg_w : SELECT endpoint
+infsvc_w --> redis_w : SET prediction
+infsvc_w --> kafka_w : produce event
+infsvc_w --> gw : 200 {predictions}
+
+' Read path flows
+infsvc_r --> redis_r : GET prediction (HIT)
+infsvc_r --> gw : 200 {predictions}
+
+' Model registry flows
+modelsvc --> pg_m : WRITE (ACID)
+pg_m ..> pg_r : async replication
+pg_r --> ui : SELECT mv_active_models
+
+@enduml

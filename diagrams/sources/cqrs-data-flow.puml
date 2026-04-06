@@ -1,0 +1,85 @@
+@startuml cqrs-data-flow
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 13
+skinparam ArrowColor #444444
+skinparam SequenceArrowThickness 2
+
+skinparam participant {
+    BackgroundColor #E8F4FD
+    BorderColor #2980B9
+    FontColor #1A1A1A
+}
+
+skinparam database {
+    BackgroundColor #FEF9E7
+    BorderColor #F39C12
+}
+
+skinparam actor {
+    BackgroundColor #EAFAF1
+    BorderColor #27AE60
+}
+
+title CQRS Data Flow — ML Platform Inference
+
+actor "Client" as client
+participant "API Gateway" as gw
+participant "Inference Service" as infsvc
+database "Redis Cache\n(Read Model)" as redis
+database "PostgreSQL Primary\n(Write Model)" as pgwrite
+database "PostgreSQL Replica\n(Read Replica)" as pgread
+queue "Kafka\ninference-logs" as kafka
+
+== Write Path (Inference Request — Cache MISS) ==
+
+client -> gw : POST /v1/infer\n{model_id, inputs}
+gw -> infsvc : forward request
+infsvc -> redis : GET cache key\n(model_id + input_hash)
+redis --> infsvc : MISS
+
+infsvc -> pgwrite : SELECT model endpoint\n(model_version WHERE state='production')
+pgwrite --> infsvc : endpoint_url, artifact_uri
+
+infsvc -> infsvc : execute inference\n(GPU / Triton)
+infsvc -> redis : SET cache key\n(TTL=300s)
+infsvc ->> kafka : produce InferenceLogged\n(fire-and-forget)
+infsvc --> gw : 200 OK {predictions}
+gw --> client : 200 OK
+
+== Read Path (Inference Request — Cache HIT) ==
+
+client -> gw : POST /v1/infer\n{model_id, inputs}
+gw -> infsvc : forward request
+infsvc -> redis : GET cache key\n(model_id + input_hash)
+redis --> infsvc : HIT (cached predictions)
+
+note right of infsvc
+  PostgreSQL не опрашивается.
+  Latency: sub-ms (Redis) vs ms (PG).
+  Target hit rate: >80%
+end note
+
+infsvc --> gw : 200 OK {predictions}
+gw --> client : 200 OK
+
+== Model Registry Read (CQRS Level 2 — UI/API) ==
+
+actor "ML Engineer\n(UI)" as eng
+participant "Model Service" as modelsvc
+
+eng -> gw : GET /v1/models
+gw -> modelsvc : forward request
+modelsvc -> pgread : SELECT FROM mv_active_models\n(materialized view)
+pgread --> modelsvc : model list
+modelsvc --> gw : 200 OK
+gw --> eng : 200 OK {models}
+
+note right of pgread
+  Read replica (async, AZ-C).
+  Eventual consistency допустима:
+  метаданные моделей меняются редко.
+end note
+
+@enduml

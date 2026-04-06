@@ -320,10 +320,10 @@ spec:
 | Класс | RTO | RPO | Компоненты | DR стратегия
 
 | Critical
-| ≤5 мин
+| ≤5 мин (внутри региона, автоматически); ≤30 мин (региональный DR, ручная процедура Baseline); ≤5 мин (региональный DR, MVP — Aurora Global Database)
 | 0 (zero data loss)
 | Inference API, API Gateway
-| Multi-AZ active-active; автоматический failover NLB
+| Multi-AZ active-active; автоматический failover NLB; региональный DR — passive warm standby (Baseline) → Aurora Global Database (MVP)
 
 | High
 | ≤15 мин
@@ -368,7 +368,9 @@ spec:
 
 *Статус в Baseline/Alpha*: DR-регион (eu-west-1) находится в режиме "passive warm standby". Полная автоматизация failover запланирована в MVP фазе.
 
-*Ручная процедура failover (RTO ≤5 мин для Critical):*
+NOTE: В Baseline/Alpha RTO для регионального failover составляет *≤30 мин* при ручной процедуре — восстановление PostgreSQL из snapshot занимает 5–15 мин, плюс время на диагностику, DNS propagation и smoke test. RTO ≤5 мин достижим только в MVP фазе при автоматизации: Aurora Global Database с continuous replication обеспечивает managed promotion реплики за 1–2 мин без восстановления из snapshot.
+
+*Ручная процедура failover (RTO ≤30 мин, Baseline):*
 
 [source,bash]
 ----
@@ -385,6 +387,7 @@ aws s3 ls s3://ml-platform-dr-eu/postgresql-backup/ \
   --recursive | sort | tail -5
 
 # 4. Восстановить PostgreSQL из snapshot в eu-west-1
+# Типичное время восстановления RDS из snapshot: 5–15 мин в зависимости от размера БД
 aws rds restore-db-instance-from-db-snapshot \
   --db-instance-identifier ml-platform-pg-eu \
   --db-snapshot-identifier <LATEST_SNAPSHOT>
@@ -397,6 +400,8 @@ helm upgrade --install ml-platform ./helm/ml-platform \
 # 6. Smoke test
 curl -f https://api-eu.ml-platform.example/health
 ----
+
+*Целевое состояние (MVP фаза)*: Aurora Global Database с continuous replication в eu-west-1. При regional failover — managed promotion secondary cluster за 1–2 мин (RTO ≤5 мин для Critical без ручного восстановления из snapshot). RPO стремится к нулю за счёт синхронной репликации.
 
 *Бэкап данных для DR*:
 

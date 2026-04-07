@@ -1,0 +1,370 @@
+=== CI/CD процесс
+
+ifndef::imagesdir[:imagesdir: {docdir}/../diagrams]
+
+==== Архитектура CI/CD
+
+Enterprise ML Platform использует GitHub Actions как оркестратор CI/CD в монорепозитории.
+
+**Ключевые решения:**
+
+* **Mono-repo** — все сервисы в одном репозитории. Path filters определяют, какие jobs запускаются при изменении конкретного сервиса.
+* **GitHub Actions** — нет дополнительной инфраструктуры для CI (Jenkins, TeamCity). OIDC интеграция с AWS исключает долгоживущие credentials.
+* **Trunk-based development** — короткие feature ветки, PR в `main`, регулярные релизы. Long-lived branches не допускаются.
+
+**Ветвление:**
+
+----
+feature/... → PR → main → staging (автоматически) → prod (manual gate)
+                              ↑
+                         hotfix/...  (прямо в staging → prod, минуя main)
+----
+
+==== Схема пайплайна
+
+image::cicd-pipeline.png[CI/CD Pipeline, width=900]
+
+_Исходник: link:diagrams/sources/cicd-pipeline.puml[cicd-pipeline.puml]_
+
+Пайплайн разделён на две фазы: CI (валидация изменений) и CD (доставка в окружения). Переход между staging и prod — явный manual gate.
+
+==== Стадии CI
+
+CI запускается на каждый PR и на push в `main`.
+
+===== Lint и статический анализ
+
+Параллельные job'ы:
+
+[cols="2,2,3"]
+|===
+| Инструмент | Цель | Что проверяет
+
+| `ruff`
+| Python linting + formatting
+| PEP 8, unused imports, type annotations
+
+| `mypy`
+| Python type checking
+| Статическая проверка типов (strict mode)
+
+| `golangci-lint`
+| Go linting
+| API Gateway: staticcheck, errcheck, gofmt
+
+| `helm lint`
+| Helm chart validation
+| YAML синтаксис, обязательные поля, template rendering
+
+| `tflint`
+| Terraform linting
+| AWS provider rules, deprecated resources, naming conventions
+
+| `spectral`
+| OpenAPI spec validation
+| Соответствие спецификации, breaking changes (с openapi-diff)
+|===
+
+===== Unit-тесты
+
+[source,yaml]
+----
+# Пример job unit-tests в GitHub Actions
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [model-service, inference-service, deployment-service, batch-workers]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run tests
+        run: |
+          cd services/${{ matrix.service }}
+          pytest --cov=. --cov-report=xml --cov-fail-under=80
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+----
+
+Требование: coverage ≥ 80% по каждому сервису. PR не мерджится при падении порога.
+
+===== Сборка образов
+
+[source,yaml]
+----
+jobs:
+  build-images:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - service: model-service
+            context: services/model-service
+          - service: inference-service
+            context: services/inference-service
+          - service: api-gateway
+            context: services/api-gateway
+    steps:
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.context }}
+          tags: |
+            ${{ env.ECR_REGISTRY }}/mlp/${{ matrix.service }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          push: ${{ github.ref == 'refs/heads/main' }}
+----
+
+Path filter: сборка конкретного образа запускается только если изменились файлы соответствующего сервиса (`paths: ['services/model-service/**']`).
+
+===== Security scan
+
+[cols="2,2,3,2"]
+|===
+| Инструмент | Тип | Что проверяет | Блокирует
+
+| Trivy
+| Container scan
+| CVE в OS пакетах и Python deps
+| CRITICAL уязвимости → PR блокируется
+
+| Semgrep
+| SAST
+| SQL injection, secrets in code, hardcoded credentials
+| HIGH findings → PR блокируется
+
+| gitleaks
+| Secret detection
+| API keys, passwords, tokens в git истории
+| Любая находка → блокируется
+
+| tfsec
+| IaC scan
+| Terraform: S3 encryption, security groups, IAM wildcards
+| HIGH findings → блокируется
+|===
+
+===== Integration-тесты
+
+Integration-тесты запускаются в ephemeral namespace в EKS (staging кластер):
+
+[source,yaml]
+----
+jobs:
+  integration-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create ephemeral namespace
+        run: |
+          NAMESPACE="ci-pr-${{ github.event.pull_request.number }}"
+          kubectl create namespace $NAMESPACE
+          kubectl label namespace $NAMESPACE ci=true pr=${{ github.event.pull_request.number }}
+
+      - name: Deploy services
+        run: |
+          helm upgrade --install mlp-ci ./helm/platform \
+            --namespace $NAMESPACE \
+            --values helm/platform/values-ci.yaml \
+            --set global.imageTag=${{ github.sha }} \
+            --wait --timeout 5m
+
+      - name: Run integration tests
+        run: pytest tests/integration/ --namespace $NAMESPACE
+
+      - name: Cleanup namespace
+        if: always()
+        run: kubectl delete namespace $NAMESPACE
+----
+
+Namespace удаляется в любом случае (if: always()), включая сбой тестов.
+
+==== Стадии CD
+
+===== Staging
+
+[cols="2,4"]
+|===
+| Параметр | Значение
+
+| Триггер
+| `push` в ветку `main` (после merge PR)
+
+| Команда
+| `helm upgrade --install mlp --atomic --timeout 10m`
+
+| Флаг `--atomic`
+| При сбое деплоя автоматический rollback к предыдущей версии Helm release
+
+| Smoke-тесты
+| Запускаются сразу после успешного деплоя (7 проверок, см. doc/4.03)
+
+| Performance-тесты
+| k6 baseline throughput test (1000 RPS, 5 мин) — результаты в VictoriaMetrics
+
+| Уведомление
+| Статус деплоя в мессенджер команды
+|===
+
+===== Production
+
+[cols="2,4"]
+|===
+| Параметр | Значение
+
+| Триггер
+| Manual approval в GitHub Actions environment `production`
+
+| Approvers
+| Минимум 1 из: Tech Lead, Senior SRE
+
+| Deploy window
+| 09:00–18:00 UTC, кроме пятницы. Вне окна — только hotfix с approver override.
+
+| Команда
+| `helm upgrade --install mlp --atomic --timeout 15m`
+
+| Стратегия
+| Rolling Update (maxUnavailable:0, maxSurge:1)
+
+| Smoke-тесты
+| После деплоя, автоматически
+
+| SLO watch
+| 15 мин мониторинг error rate и latency после деплоя. Алерт при отклонении → ручной откат.
+
+| Hotfix path
+| hotfix/* ветка → PR в main → emergency approve → прямой деплой в prod с нотификацией
+|===
+
+==== Секреты в CI/CD
+
+===== GitHub Actions OIDC → AWS IAM
+
+Долгоживущие AWS credentials не хранятся в GitHub Secrets. Вместо этого используется OIDC federation:
+
+[source,yaml]
+----
+permissions:
+  id-token: write    # разрешить запрос OIDC токена
+  contents: read
+
+steps:
+  - uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: arn:aws:iam::123456789:role/mlp-github-actions-role
+      aws-region: eu-west-1
+      # GitHub автоматически получает OIDC токен и обменивает на временные credentials
+----
+
+IAM Role `mlp-github-actions-role` ограничена trust policy: только запросы из репозитория `org/ml-platform` в ветках `main` и `refs/pull/*`.
+
+===== Vault AppRole для CD
+
+Deployment Service в CI/CD использует Vault AppRole для получения динамических credentials:
+
+[source,yaml]
+----
+- name: Get Vault token
+  env:
+    VAULT_ROLE_ID: ${{ secrets.VAULT_ROLE_ID }}       # статичный, не секрет
+    VAULT_SECRET_ID: ${{ secrets.VAULT_SECRET_ID }}   # ротируется каждые 24h
+  run: |
+    VAULT_TOKEN=$(vault write auth/approle/login \
+      role_id=$VAULT_ROLE_ID secret_id=$VAULT_SECRET_ID \
+      -format=json | jq -r .auth.client_token)
+    echo "VAULT_TOKEN=$VAULT_TOKEN" >> $GITHUB_ENV
+----
+
+===== gitleaks
+
+gitleaks запускается на каждый PR как pre-commit проверка истории коммитов:
+
+[source,yaml]
+----
+- uses: gitleaks/gitleaks-action@v2
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  with:
+    config-path: .gitleaks.toml
+----
+
+==== Откат
+
+===== Три уровня отката
+
+[cols="2,2,4"]
+|===
+| Уровень | Триггер | Механизм
+
+| **Helm atomic rollback**
+| Сбой `helm upgrade` (pod не стартует, health check fail)
+| `--atomic` флаг: Helm автоматически откатывает к предыдущей revision. Без вмешательства инженера.
+
+| **Автооткат по метрикам**
+| Alertmanager: error rate >5% или p99 >500ms в течение 5 мин после деплоя
+| Alertmanager webhook → GitHub Actions workflow `rollback.yml` → `helm rollback mlp $((REVISION-1))`
+
+| **Ручной через ChatOps**
+| Инженер вводит команду в мессенджер
+| Бот отправляет запрос в API, который запускает `rollback.yml` workflow с указанием target revision
+|===
+
+===== ML-специфика: откат модели через FSM
+
+Откат версии модели — отдельная операция от отката Helm chart:
+
+----
+serving → (rollback command) → rolling_back → deployed (предыдущая версия)
+                                    ↓
+                              (Triton перезагружает предыдущую версию модели из S3)
+----
+
+FSM переход `rollback` доступен из состояния `serving` и `failed`. Триггер — либо ручная команда через API (`POST /v1/models/{id}/rollback`), либо автоматически при breach SLO по конкретной модели. Подробнее — см. doc/3.01 (State Machine).
+
+==== Управление конфигурацией
+
+===== Non-secret конфигурация
+
+Хранится в ConfigMap. Параметры, специфичные для окружения — в `values-{env}.yaml`:
+
+[source,yaml]
+----
+# Пример ConfigMap для inference-service
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: inference-service-config
+data:
+  CACHE_TTL_SECONDS: "300"
+  CIRCUIT_BREAKER_THRESHOLD: "50"
+  MAX_BATCH_SIZE: "32"
+  LOG_LEVEL: "INFO"
+----
+
+===== Секреты
+
+Секреты не хранятся в ConfigMap и не коммитятся в репозиторий. Vault Agent Sidecar инжектирует их как файлы в `/vault/secrets/` при старте пода (см. doc/3.01 — Управление секретами).
+
+===== Feature Flags
+
+Feature flags управляются через ConfigMap с hot-reload (inotify на изменение файла). Изменение флага не требует рестарта пода.
+
+[cols="3,2,3"]
+|===
+| Feature Flag | Default (Baseline) | Описание
+
+| `inference.cache.enabled`
+| `true`
+| Включение Redis кэша для inference ответов
+
+| `debug.tenant_id`
+| `""` (выключен)
+| Включить DEBUG логирование для конкретного tenant. Автоматически сбрасывается через 1 час.
+
+| `deployment.canary.enabled`
+| `false`
+| Canary deployment для моделей (extension point MVP). В Baseline — Rolling.
+|===
+
+NOTE: Полноценная система feature flags (LaunchDarkly, Unleash) рассматривается как extension point для MVP, когда появятся требования к A/B тестированию моделей.

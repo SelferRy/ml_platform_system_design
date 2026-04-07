@@ -1,0 +1,472 @@
+=== Схема развертывания
+
+ifndef::imagesdir[:imagesdir: {docdir}/../diagrams]
+
+==== Принципы IaC
+
+Инфраструктура Enterprise ML Platform управляется через два уровня IaC с чётким разделением ответственности:
+
+[cols="2,2,3,2"]
+|===
+| Уровень | Инструмент | Что управляет | Принцип
+
+| Облачная инфраструктура
+| Terraform
+| VPC, EKS кластер, RDS, ElastiCache, MSK, S3 бакеты, IAM роли, security groups
+| "Не существует без кода" — никакие ресурсы не создаются вручную через AWS Console
+
+| K8s приложения
+| Helm
+| Deployments, Services, ConfigMaps, HPA, KEDA ScaledObjects, NetworkPolicies, ServiceAccounts
+| "Не существует без chart" — все Kubernetes-объекты декларативны
+|===
+
+Принцип разделения: Terraform не знает о K8s-объектах выше уровня node group. Helm не знает о AWS-ресурсах ниже уровня IAM ServiceAccount (через IRSA). Граница — EKS endpoint + OIDC provider, которые Terraform передаёт в Helm через outputs.
+
+Все изменения проходят через CI/CD пайплайн (см. раздел 4.02). Прямой доступ на production AWS аккаунт ограничен политиками IAM.
+
+==== Структура Terraform
+
+===== Дерево модулей
+
+----
+terraform/
+├── environments/
+│   ├── dev/
+│   │   ├── main.tf
+│   │   └── terraform.tfvars
+│   ├── staging/
+│   │   ├── main.tf
+│   │   └── terraform.tfvars
+│   └── prod/
+│       ├── main.tf
+│       └── terraform.tfvars
+└── modules/
+    ├── networking/      # VPC, subnets, NAT GW, route tables
+    ├── eks/             # EKS cluster, node groups, OIDC
+    ├── rds/             # PostgreSQL RDS Multi-AZ
+    ├── elasticache/     # Redis Sentinel cluster
+    ├── msk/             # Kafka MSK cluster
+    ├── s3/              # S3 бакеты (models, batch, static)
+    ├── iam/             # IAM roles, policies, IRSA bindings
+    └── vault/           # HashiCorp Vault на K8s (через K8s provider)
+----
+
+===== Таблица модулей
+
+[cols="2,3,3"]
+|===
+| Модуль | Создаваемые ресурсы | Зависимости
+
+| `networking`
+| VPC (10.0.0.0/16), 3 public + 3 private subnets (по AZ), NAT Gateway × 3, Internet Gateway, route tables
+| Нет (базовый модуль)
+
+| `eks`
+| EKS кластер 1.29, node group (on-demand m5.large min=2/max=10), GPU node group (g4dn.xlarge min=1/max=5), managed add-ons (CoreDNS, kube-proxy, VPC CNI, EBS CSI)
+| `networking`
+
+| `rds`
+| PostgreSQL 15 RDS Multi-AZ (db.r6g.large Baseline), parameter group, subnet group, automated backups, secrets в AWS Secrets Manager
+| `networking`, `iam`
+
+| `elasticache`
+| Redis 7 Sentinel cluster (cache.r6g.large × 3), subnet group, parameter group
+| `networking`
+
+| `msk`
+| Kafka 3.5 MSK cluster (kafka.m5.large × 3, RF=3), schema registry endpoint, IAM auth
+| `networking`, `iam`
+
+| `s3`
+| Бакеты: `mlp-models-{env}` (versioning on), `mlp-batch-{env}` (lifecycle 30d→Glacier), `mlp-static-{env}` (public read для CDN), `mlp-backups-{env}` (cross-region replication для prod)
+| `iam`
+
+| `iam`
+| IAM роли для IRSA (inference-service, model-service, batch-workers, deployment-service), IAM роль для CI/CD (OIDC GitHub Actions), instance profiles
+| `eks` (OIDC provider ARN)
+
+| `vault`
+| HashiCorp Vault Helm chart, Vault Kubernetes Auth backend, PKI secrets engine, dynamic PG credentials engine
+| `eks`, `rds`
+|===
+
+===== ML-специфика: GPU Node Group
+
+GPU node group для Triton Inference Server:
+
+[source,hcl]
+----
+resource "aws_eks_node_group" "gpu" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "gpu-workers"
+  node_role_arn   = aws_iam_role.node.arn
+  subnet_ids      = module.networking.private_subnet_ids
+
+  instance_types = ["g4dn.xlarge"]   # 1× NVIDIA T4, 16 GB GPU, 4 vCPU, 16 GB RAM
+
+  scaling_config {
+    min_size     = 1
+    max_size     = 5
+    desired_size = 1
+  }
+
+  taint {
+    key    = "nvidia.com/gpu"
+    value  = "true"
+    effect = "NO_SCHEDULE"
+  }
+
+  labels = {
+    "node-type"       = "gpu"
+    "workload-profile" = "inference"
+  }
+}
+----
+
+После создания node group устанавливаются:
+
+* **NVIDIA device plugin DaemonSet** — экспонирует `nvidia.com/gpu` resource в K8s
+* **Cluster Autoscaler** — настроен на GPU node group, scale-down delay 10 мин (холодный старт GPU)
+* **DCGM Exporter DaemonSet** — GPU метрики для VictoriaMetrics (`mlp_gpu_utilization_percent`)
+
+==== Bootstrap-последовательность
+
+===== Порядок применения
+
+----
+Шаг 1: terraform apply -target=module.networking
+        ↓ (создаёт VPC, subnets, NAT GW)
+
+Шаг 2: terraform apply -target=module.eks
+        ↓ (создаёт кластер, node groups, OIDC provider)
+
+Шаг 3 (параллельно):
+        terraform apply -target=module.rds
+        terraform apply -target=module.elasticache
+        terraform apply -target=module.msk
+        terraform apply -target=module.s3
+        terraform apply -target=module.iam
+        ↓ (независимые ресурсы, зависят только от networking + iam)
+
+Шаг 4: terraform apply -target=module.vault
+        ↓ (Vault требует работающий EKS и RDS для dynamic credentials)
+
+Шаг 5: helm install cert-manager (system/)
+        ↓ (TLS сертификаты нужны всем сервисам)
+
+Шаг 6 (параллельно):
+        helm install vault-agent-injector
+        helm install observability-stack (Grafana, VictoriaMetrics, Loki, Alertmanager)
+        helm install keda
+        helm install nvidia-device-plugin
+        ↓ (системный слой)
+
+Шаг 7: helm install platform/ (api-gateway, model-service, inference-service, ...)
+        ↓ (платформенные сервисы)
+----
+
+===== Почему Vault до приложений
+
+Vault устанавливается на Шаге 4, до любых платформенных сервисов, по двум причинам:
+
+1. **Dynamic credentials**: при старте каждый pod запрашивает у Vault динамические credentials для PostgreSQL (TTL 1h). Если Vault недоступен — pod не может стартовать. Vault должен быть Ready до первого `helm install` платформы.
+2. **PKI и TLS**: cert-manager использует Vault PKI backend для выпуска сертификатов. Vault PKI должен быть инициализирован до cert-manager (Шаг 5).
+
+==== Helm-структура
+
+===== Дерево charts
+
+----
+helm/
+├── system/                         # Системный слой (инфраструктурные компоненты)
+│   ├── cert-manager/               # TLS сертификаты (Let's Encrypt + Vault PKI)
+│   ├── vault/                      # HashiCorp Vault + Agent Injector
+│   ├── observability/              # VictoriaMetrics, Loki, Grafana, Alertmanager
+│   │   └── values-{env}.yaml
+│   ├── keda/                       # Kubernetes Event-Driven Autoscaling
+│   └── nvidia-device-plugin/       # GPU resource экспозиция
+│
+└── platform/                       # Платформенный слой (ML Platform сервисы)
+    ├── api-gateway/
+    │   └── values-{env}.yaml
+    ├── model-service/
+    │   └── values-{env}.yaml
+    ├── inference-service/          # Обёртка над Triton
+    │   └── values-{env}.yaml
+    ├── deployment-service/
+    │   └── values-{env}.yaml
+    ├── batch-workers/
+    │   └── values-{env}.yaml
+    └── ui/
+        └── values-{env}.yaml
+----
+
+===== ML-специфика: Triton Inference Server
+
+Triton требует особой конфигурации в Helm chart inference-service:
+
+**Init-контейнер для загрузки модели из S3:**
+
+[source,yaml]
+----
+initContainers:
+  - name: model-loader
+    image: amazon/aws-cli:2.15
+    command:
+      - sh
+      - -c
+      - |
+        aws s3 sync s3://mlp-models-${ENV}/artifacts/${MODEL_ID}/${VERSION}/ \
+          /model-repository/${MODEL_ID}/
+    env:
+      - name: MODEL_ID
+        valueFrom:
+          fieldRef:
+            fieldPath: metadata.annotations['mlp/model-id']
+    volumeMounts:
+      - name: model-repository
+        mountPath: /model-repository
+----
+
+Модели не упаковываются внутрь Docker образа — они загружаются в shared volume при старте пода. Это позволяет обновлять модели без пересборки образа.
+
+**Startup probe с увеличенным таймаутом:**
+
+[source,yaml]
+----
+startupProbe:
+  httpGet:
+    path: /v2/health/ready
+    port: 8000
+  failureThreshold: 60    # 60 × 10s = 600s максимум на загрузку модели
+  periodSeconds: 10
+  initialDelaySeconds: 30
+----
+
+**Пример Helm values для inference-service (prod):**
+
+[source,yaml]
+----
+# helm/platform/inference-service/values-prod.yaml
+replicaCount: 3
+
+image:
+  repository: 123456789.dkr.ecr.eu-west-1.amazonaws.com/mlp/inference-service
+  pullPolicy: IfNotPresent
+
+triton:
+  image: nvcr.io/nvidia/tritonserver:24.01-py3
+  modelRepositoryBucket: mlp-models-prod
+  grpcPort: 8001
+  httpPort: 8000
+  metricsPort: 8002
+
+resources:
+  requests:
+    memory: "8Gi"
+    cpu: "2"
+    nvidia.com/gpu: "1"
+  limits:
+    memory: "14Gi"
+    cpu: "4"
+    nvidia.com/gpu: "1"
+
+tolerations:
+  - key: "nvidia.com/gpu"
+    operator: "Equal"
+    value: "true"
+    effect: "NoSchedule"
+
+nodeSelector:
+  node-type: gpu
+
+hpa:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 10
+  targetGPUUtilization: 70
+
+preStopHook:
+  sleepSeconds: 15    # дать время завершить in-flight запросы
+----
+
+==== Управление окружениями
+
+[cols="2,2,2,2,2,2,2,2,2"]
+|===
+| Параметр | dev | staging | prod
+
+| AZ
+| 1 (eu-west-1a)
+| 2 (eu-west-1a/b)
+| 3 (eu-west-1a/b/c)
+
+| PostgreSQL
+| db.t3.medium, single-AZ
+| db.r6g.large, Multi-AZ
+| db.r6g.large, Multi-AZ + read replica
+
+| Redis
+| cache.t3.micro, single node
+| cache.r6g.large, Sentinel (×3)
+| cache.r6g.large, Sentinel (×3)
+
+| Kafka (MSK)
+| Нет (mock или LocalStack)
+| kafka.m5.large × 2, RF=2
+| kafka.m5.large × 3, RF=3
+
+| GPU (Triton)
+| CPU-only режим (нет GPU ноды)
+| g4dn.xlarge × 1 (shared)
+| g4dn.xlarge × 1 (min), ×5 (max)
+
+| Vault
+| Dev mode (in-memory)
+| Prod mode, 1 replica
+| Prod mode, HA 3 replicas
+
+| Replicas (inference)
+| 1
+| 2
+| 3 (min)
+
+| SLO
+| Best effort
+| 99.5%
+| 99.9%
+|===
+
+**GPU в dev: Triton CPU-only режим.** В dev окружении GPU node group отсутствует. Triton запускается с флагом `--backend-config=tensorflow,version=2` в CPU-only конфигурации. Это позволяет тестировать pipeline развёртывания без GPU ресурсов, но с деградацией производительности (~10× медленнее). Для тестов производительности используется staging.
+
+==== Контейнеризация
+
+===== Стратегия образов
+
+[cols="3,2"]
+|===
+| Принцип | Реализация
+
+| **Base images**
+| Python сервисы: `python:3.11-slim`. Go сервисы: `golang:1.22-alpine` builder + `gcr.io/distroless/static` runtime. Обновление base images еженедельно через Dependabot.
+
+| **Multi-stage build**
+| Stage 1 (builder): установка зависимостей, компиляция. Stage 2 (runtime): только артефакты, без build tools. Уменьшает размер образа и attack surface.
+
+| **Версионирование**
+| Tag = commit SHA (8 символов). `latest` не используется в prod. Пример: `mlp/inference-service:a3f9b12c`. Дополнительно тег окружения: `mlp/inference-service:staging` для canary promotion.
+
+| **ECR lifecycle**
+| Хранить последние 10 образов per сервис. Образы старше 30 дней с тегом `staging` — удалять. Образы `prod-*` — хранить 1 год (аудит).
+|===
+
+===== Таблица образов
+
+[cols="2,2,3,2"]
+|===
+| Сервис | Base image | Особенности | Размер (целевой)
+
+| Model Service
+| `python:3.11-slim`
+| SQLAlchemy, Pydantic, boto3. State machine logic. Без GPU.
+| < 500 MB
+
+| Inference Service
+| `python:3.11-slim` (обёртка)
+| Обёртка над Triton: gRPC клиент, Circuit Breaker, cache. Triton — отдельный контейнер в pod.
+| < 300 MB
+
+| Deployment Service
+| `python:3.11-slim`
+| Temporal SDK, Kubernetes client. Orchestrates FSM.
+| < 400 MB
+
+| Batch Workers
+| `python:3.11-slim`
+| pandas, numpy, boto3. KEDA consumer. S3 streaming.
+| < 600 MB
+
+| API Gateway
+| `golang:1.22-alpine` → `distroless`
+| Reverse proxy, auth middleware, rate limiter. Zero runtime deps.
+| < 50 MB
+
+| Triton Inference Server
+| `nvcr.io/nvidia/tritonserver:24.01-py3`
+| NVIDIA official image. Модели — НЕ внутри образа (загружаются из S3 init-контейнером).
+| ~10 GB (CUDA libs)
+|===
+
+NOTE: Triton образ весит ~10 GB из-за CUDA toolkit. Для ускорения pull используется ECR pull-through cache и node-level image pre-pull DaemonSet на GPU нодах.
+
+==== Обновление ПО без простоев
+
+===== Rolling Update
+
+Стандартная стратегия для всех платформенных сервисов:
+
+[source,yaml]
+----
+strategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 0    # никогда не уменьшать ниже желаемого числа реплик
+    maxSurge: 1          # одновременно поднять один дополнительный pod
+----
+
+Kubernetes поднимает новый pod, ждёт readiness probe, затем завершает один старый pod — и так по кругу. При `maxUnavailable: 0` в любой момент доступны все `replicaCount` реплик.
+
+===== Сценарий для Triton (детализация)
+
+Triton требует особого внимания из-за большого startup probe и долгого завершения:
+
+----
+1. Создаётся новый Triton pod
+2. init-контейнер (model-loader) скачивает модель из S3 (30-120с)
+3. Triton стартует, загружает модель в VRAM
+4. startupProbe: GET /v2/health/ready, failureThreshold=60, period=10s
+   → максимум 600с на готовность
+5. Pod переходит в Ready → получает трафик через Service
+6. Kubernetes посылает SIGTERM старому pod
+7. PreStop hook: sleep 15s (drain in-flight запросы)
+8. Triton завершает обработку текущих батчей
+9. Контейнер завершается (terminationGracePeriodSeconds: 60)
+----
+
+===== Когда Rolling Update НЕ гарантирует zero-downtime
+
+[cols="2,3,3"]
+|===
+| Сценарий | Проблема | Митигация
+
+| **Схема БД**
+| Новая версия ожидает колонку, которой нет. Или старая версия несовместима с новой схемой.
+| Backwards-compatible migrations: только `ADD COLUMN DEFAULT NULL`. `DROP COLUMN` — в отдельном деплое через 2 недели.
+
+| **API-контракт**
+| Клиент отправляет запрос старого формата к новому pod или наоборот.
+| API versioning `/v1/`, `/v2/`. Старый endpoint держится минимум 1 мажорный релиз.
+
+| **Kafka schema**
+| Новый consumer не может десериализовать сообщения старого формата.
+| Schema Registry + backward-compatible эволюция (только `OPTIONAL` поля). `buf breaking` check в CI.
+
+| **Модель Triton**
+| Новая версия модели ожидает другой input shape или тип.
+| Model версионирование в репозитории. Одновременно активны v1 и v2 — переключение через feature flag, откат через FSM (см. doc/3.01).
+|===
+
+===== Blue-Green как альтернатива
+
+Для критических обновлений (смена major версии, breaking change в схеме БД, замена модели) используется Blue-Green:
+
+1. Поднять полный второй stack (Green) параллельно с текущим (Blue)
+2. Запустить smoke + integration тесты на Green
+3. Переключить Load Balancer target group: 100% трафик на Green
+4. Blue держать 15 мин как fallback
+5. Удалить Blue stack
+
+Blue-Green увеличивает затраты на ~2× в момент переключения. Для Baseline используется редко — только при breaking changes.
+
+NOTE: GitOps (ArgoCD) и Canary (Flagger) рассматриваются как extension points для MVP фазы, когда появятся требования к progressive delivery.

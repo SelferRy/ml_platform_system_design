@@ -1,0 +1,124 @@
+@startuml cicd-pipeline
+title CI/CD Pipeline — Enterprise ML Platform (Baseline/Alpha)
+
+skinparam backgroundColor #FAFAFA
+skinparam activity {
+    BackgroundColor #E8F4FD
+    BorderColor #2980B9
+    FontSize 12
+}
+skinparam activityDiamond {
+    BackgroundColor #FEF9E7
+    BorderColor #F39C12
+}
+skinparam note {
+    BackgroundColor #EAF7EA
+    BorderColor #27AE60
+}
+
+|#E8F4FD|Developer|
+start
+:Открыт Pull Request\n(feature/fix ветка);
+
+|#FFF3E0|CI Pipeline|
+fork
+    :lint + unit tests\n(pytest, go test, ruff, golangci-lint)\nCoverage ≥80%;
+fork again
+    :contract tests\n(buf lint + buf breaking,\nspectral lint, openapi-diff);
+end fork
+
+:build Docker images\n(multi-stage, matrix по сервисам)\ntag = commit SHA;
+
+:push to ECR\n(только изменённые сервисы\nпо path filter monorepo);
+
+fork
+    :security scan\n(Trivy: CRITICAL CVE → fail\ngitleaks: secrets scan);
+fork again
+    :SAST\n(Semgrep: SQL injection,\nhardcoded credentials);
+end fork
+
+:integration tests\n(ephemeral namespace pr-{number}\nephemeral K8s dev cluster\nTriton CPU-only режим);
+
+note right
+  5 сценариев:
+  1. E2E inference flow
+  2. Tenant isolation (security gate)
+  3. Auth/Authz
+  4. Model lifecycle FSM
+  5. Batch job
+end note
+
+if (Все проверки прошли?) then (нет)
+    :PR заблокирован\nCIstatus = fail;
+    stop
+else (да)
+    :PR approvals\n(Code Review);
+endif
+
+|Developer|
+:Merge в main;
+
+|#F3E5F5|CD Staging|
+:helm upgrade --atomic staging\n--timeout 10m;
+
+note right
+  --atomic: автооткат если
+  поды не стали Ready
+end note
+
+:Smoke tests на staging\n(7 проверок, <2 мин);
+
+if (Smoke tests pass?) then (нет)
+    :helm rollback staging\nP1 алерт;
+    stop
+else (да)
+endif
+
+:Performance tests на staging\n(k6: baseline 1000 RPS\n+ spike test 10×\n~30 мин);
+
+if (Performance thresholds met?\np99 ≤100ms, error rate <0.1%) then (нет)
+    :Отчёт о нарушениях NFR\nDeployment заблокирован;
+    stop
+else (да)
+endif
+
+|#E8F5E9|CD Production|
+:Manual Approve\n(Platform Lead + SRE Lead)\nDeploy window: 09:00-18:00 UTC\nНе в пятницу;
+
+if (Approved?) then (нет)
+    :Deployment отменён;
+    stop
+else (да)
+endif
+
+:helm upgrade --atomic prod\n(Rolling Update:\nmaxUnavailable=0, maxSurge=1);
+
+note right
+  Inference Service:
+  Startup probe ≤10 мин
+  (модель до 10 GB из S3)
+  terminationGracePeriod=30s
+end note
+
+:Post-deploy Smoke tests prod\n(7 проверок, <2 мин);
+
+if (Smoke tests pass?) then (нет)
+    :helm rollback prod\nP0/P1 алерт;
+    stop
+else (да)
+endif
+
+:SLO Monitoring 15 мин\n(burn rate watch\nAlertmanager наблюдает\nза P0/P1 алертами);
+
+if (P0/P1 алерт в течение 15 мин?) then (да)
+    :Автоматический откат\n(Alertmanager webhook\n→ helm rollback prod)\nP0 инцидент;
+    stop
+else (нет)
+endif
+
+:Deployment COMPLETED\nAudit log: DEPLOYMENT_COMPLETED\n{actor, commit_sha, image_tag};
+
+|Developer|
+stop
+
+@enduml

@@ -50,7 +50,6 @@
 . (+) Добавлены Protobuf-схемы: InferenceService.proto (Predict, HealthCheck) и events.proto (DeploymentRequested, DeploymentSucceeded, DeploymentFailed, InferenceLogged) — doc/2.12
 . (+) Раскомментированы include для 2.11 и 2.12 в architecture-decision.adoc
 
-
 == ДЗ 4
 2025.04.05
 
@@ -86,3 +85,25 @@
 . (+) Созданы runbook'и для 3 security-инцидентов: компрометация API-ключа (RTO <5 мин), нарушение изоляции тенантов (P0, RTO <2 мин), истечение TLS-сертификата — doc/3.02
 . (+) Добавлены Vault и OPA в таблицы паттернов и ключевых компонентов — doc/2.02
 . (+) Раскомментирован include секции "Безопасность" в architecture-decision.adoc
+
+== ДЗ 6
+2026.04.07
+
+. (+) Создан раздел "Схема развертывания": IaC двухуровневая структура (Terraform — облачная инфраструктура, Helm — Kubernetes workloads), 8 Terraform модулей с таблицей зависимостей, ML-специфика GPU node group (g4dn.xlarge, NVIDIA device plugin, Cluster Autoscaler), bootstrap-последовательность из 8 шагов с обоснованием порядка — doc/4.01
+. (+) Описана Helm-структура: system layer (cert-manager, Vault, observability, KEDA, nvidia-plugin) и platform layer (api-gateway, model-service, inference-service, deployment-service, batch-workers, ui) — doc/4.01
+. (+) Описано управление окружениями dev/staging/prod: таблица различий по 8 параметрам (AZ count, PostgreSQL, Redis, Kafka, GPU nodes, Vault mode, replicas, SLO); GPU-mocking в dev через Triton CPU-only режим — doc/4.01
+. (+) Описана стратегия контейнеризации: base images (UBI8/Debian slim, nvcr.io/nvidia/tritonserver), multi-stage builds, immutable tags (commit SHA), ECR lifecycle policy; таблица образов 5 сервисов с размерами — doc/4.01
+. (+) Описан Rolling Update без простоев: maxUnavailable=0, maxSurge=1; Triton Startup probe 10 мин grace period; PreStop hook 5s для iptables; 4 случая когда rolling update недостаточен — doc/4.01
+. (+) Создан раздел "CI/CD процесс": GitHub Actions монорепозиторий, 5 стадий CI (lint, contract tests, build, security scan, integration tests в ephemeral namespace), 2 стадии CD (staging auto-deploy, prod manual gate) — doc/4.02
+. (+) Описана схема управления секретами в CI/CD: GitHub Actions OIDC → AWS IAM (без статических credentials), Vault AppRole для сервисов; gitleaks в pre-commit + CI — doc/4.02
+. (+) Описан трёхуровневый откат: автоматический (helm --atomic), автоматический по метрикам (Alertmanager webhook → helm rollback при P0/P1 в 15 мин окне), ручной (chatops) — doc/4.02
+. (+) Создан раздел "Планы тестирования": расширенная пирамида тестирования для ML Platform (8 уровней: unit, contract, integration, model validation, smoke, performance, chaos, security) с таблицей инструментов и времени выполнения — doc/4.03
+. (+) Описаны unit-тесты per service: Model Service (state machine, validation, tenant isolation, idempotency), Inference Service (cache, circuit breaker, routing, input validation), Deployment Service (Temporal workflows, rollback logic, K8s API), Batch Workers (chunking, DLQ, throughput) — doc/4.03
+. (+) Описаны contract-тесты: gRPC (buf lint + buf breaking), REST (spectral lint + openapi-diff), Kafka (Protobuf evolution, Schema Registry как extension point для MVP) — doc/4.03
+. (+) Описаны 5 integration-тестовых сценариев в ephemeral namespace: e2e inference flow, tenant isolation (security gate), auth/authz, model lifecycle FSM, batch job — doc/4.03
+. (+) Описаны Model Validation Tests (ML-специфика): latency validation (p99 ≤100ms), accuracy validation (dataset из S3, threshold per model), input/output schema, memory footprint GPU; Kubernetes Job как часть FSM validating — doc/4.03
+. (+) Описаны 7 smoke-проверок после деплоя с автоматическим rollback при fail; нагрузочные тесты k6 (4 сценария: baseline 1000 RPS, spike 10×, batch capacity, GPU cold start); chaos-тесты Chaos Mesh (5 сценариев: pod kill, AZ failure, network latency, GPU pod, Kafka broker) — doc/4.03
+. (+) Создана activity-диаграмма CI/CD пайплайна: PR → параллельные CI стадии → merge → staging deploy → smoke → perf test → manual gate → prod deploy → smoke → SLO watch с ветками rollback — diagrams/cicd-pipeline.puml → PNG
+. (+) Создана deployment-диаграмма IaC: Terraform модули → AWS ресурсы, Helm charts → K8s workloads, Vault как cross-cutting concern, bootstrap-зависимости — diagrams/deployment-iac.puml → PNG
+. (+) Добавлена секция "Observability CI/CD процесса" в раздел Observability: DORA-метрики (deployment frequency, lead time, change failure rate, MTTR), кастомная метрика mlp_deployment_total{env,status,service}, Grafana дашборд "Delivery Metrics", связь с audit log (DEPLOYMENT_STARTED/COMPLETED/ROLLED_BACK) — doc/2.09
+. (+) Раскомментированы include секции "Доставка решения" (4.01, 4.02, 4.03) в architecture-decision.adoc

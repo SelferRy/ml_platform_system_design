@@ -49,7 +49,6 @@
 . (+) Добавлены OpenAPI-контракты для 4 ключевых эндпоинтов: POST /v1/models, POST /v1/models/{id}/deploy, POST /v1/infer, GET /v1/models/{id} — doc/2.12
 . (+) Добавлены Protobuf-схемы: InferenceService.proto (Predict, HealthCheck) и events.proto (DeploymentRequested, DeploymentSucceeded, DeploymentFailed, InferenceLogged) — doc/2.12
 . (+) Раскомментированы include для 2.11 и 2.12 в architecture-decision.adoc
-. (+) Каналы алертинга абстрагированы от конкретного мессенджера (Telegram/Slack/MS Teams — на выбор) — doc/2.09, doc/2.10, diagrams/observability.puml
 
 
 == ДЗ 4

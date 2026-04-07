@@ -1,0 +1,94 @@
+@startuml deployment-iac
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Component.puml
+
+title IaC структура развёртывания — Enterprise ML Platform (Baseline/Alpha)
+
+LAYOUT_WITH_LEGEND()
+
+Person(engineer, "Platform Engineer", "Применяет IaC изменения")
+
+System_Boundary(iac, "Infrastructure as Code (Git Repository)") {
+
+    System_Boundary(terraform_layer, "Terraform — Cloud Infrastructure") {
+        Component(tf_networking, "module: networking", "Terraform", "VPC, 3 public/private subnets,\nIGW, NAT Gateway, Security Groups")
+        Component(tf_eks, "module: eks", "Terraform", "EKS cluster, cpu-nodegroup (m5.2xlarge),\ngpu-nodegroup (g4dn.xlarge, taint=gpu:true),\nNVIDIA device plugin DaemonSet")
+        Component(tf_data, "module: rds + elasticache + msk", "Terraform", "PostgreSQL Multi-AZ (db.r6g.4xlarge),\nRedis Sentinel (cache.r6g.large),\nKafka MSK 3 brokers RF=3")
+        Component(tf_s3, "module: s3", "Terraform", "5 buckets: artifacts, static,\nbackups, logs, terraform-state")
+        Component(tf_iam, "module: iam", "Terraform", "IRSA per service: inference-role (S3 get),\ndeployment-role (EKS API),\nmodel-role (S3 put)")
+        Component(tf_vault, "module: vault", "Terraform/Helm", "HashiCorp Vault на EKS,\nbootstrap через init job,\nauto-unseal KMS")
+    }
+
+    System_Boundary(helm_layer, "Helm — Kubernetes Workloads") {
+
+        System_Boundary(helm_system, "helm/system/ — System Layer") {
+            Component(h_certmgr, "cert-manager", "Helm Chart", "TLS certificates,\nVault PKI integration")
+            Component(h_observ, "observability", "Helm Chart", "VictoriaMetrics, Loki,\nGrafana, Alertmanager,\nFluent Bit, Prometheus Agent")
+            Component(h_keda, "keda", "Helm Chart", "KEDA operator для\nbatch workers scale-to-zero")
+            Component(h_nvidia, "nvidia-plugin", "Helm Chart", "NVIDIA device plugin DaemonSet\n(GPU resource scheduling)")
+        }
+
+        System_Boundary(helm_platform, "helm/platform/ — Platform Layer") {
+            Component(h_gw, "api-gateway", "Helm Chart", "Kong/Envoy + WAF config,\nOAuth 2.0/OIDC, Rate Limiting")
+            Component(h_model, "model-service", "Helm Chart", "FastAPI + Vault Agent Sidecar,\nFSM state machine, min:2 replicas")
+            Component(h_inf, "inference-service", "Helm Chart", "Triton Inference Server,\nGPU taint toleration,\nHPA min:3 max:20 / 800 RPS")
+            Component(h_deploy, "deployment-service", "Helm Chart", "Go + Temporal worker,\nKubernetes API access via IRSA")
+            Component(h_batch, "batch-workers", "Helm Chart", "KEDA ScaledJob по Kafka lag,\nmin:0 max:20 workers")
+            Component(h_ui, "ui", "Helm Chart", "Web Console,\nCloudFront invalidation job")
+        }
+    }
+}
+
+System_Boundary(aws, "AWS Cloud (us-east-1)") {
+    System_Ext(aws_vpc, "VPC + Subnets", "Networking")
+    System_Ext(aws_eks, "EKS Cluster", "Kubernetes")
+    System_Ext(aws_rds, "RDS PostgreSQL Multi-AZ", "Database")
+    System_Ext(aws_redis, "ElastiCache Redis Sentinel", "Cache")
+    System_Ext(aws_msk, "MSK Kafka", "Message Queue")
+    System_Ext(aws_s3, "S3 Buckets", "Object Storage")
+    System_Ext(aws_iam_aws, "IAM Roles", "Access Control")
+    System_Ext(aws_kms, "KMS", "Key Management")
+}
+
+' Engineer actions
+Rel(engineer, tf_networking, "terraform apply", "Bootstrap step 1")
+Rel(engineer, tf_eks, "terraform apply", "Bootstrap step 2")
+Rel(engineer, tf_data, "terraform apply", "Bootstrap step 3 (parallel)")
+Rel(engineer, tf_vault, "helm install vault", "Bootstrap step 4")
+Rel(engineer, h_observ, "helm install", "Bootstrap step 7")
+Rel(engineer, h_model, "helm upgrade", "Platform deploy")
+
+' Terraform dependencies
+Rel(tf_eks, tf_networking, "depends_on", "EKS requires VPC")
+Rel(tf_data, tf_networking, "depends_on", "RDS/MSK/Redis require VPC")
+Rel(tf_iam, tf_eks, "depends_on", "IRSA requires EKS OIDC")
+Rel(tf_vault, tf_eks, "depends_on", "Vault runs on EKS")
+
+' Terraform provisions AWS
+Rel(tf_networking, aws_vpc, "manages", "create/update/destroy")
+Rel(tf_eks, aws_eks, "manages", "create/update/destroy")
+Rel(tf_data, aws_rds, "manages", "")
+Rel(tf_data, aws_redis, "manages", "")
+Rel(tf_data, aws_msk, "manages", "")
+Rel(tf_s3, aws_s3, "manages", "")
+Rel(tf_iam, aws_iam_aws, "manages", "IRSA bindings")
+Rel(tf_vault, aws_kms, "uses", "auto-unseal")
+
+' Helm provisions K8s workloads on EKS
+Rel(h_certmgr, aws_eks, "deploys to", "")
+Rel(h_observ, aws_eks, "deploys to", "")
+Rel(h_keda, aws_eks, "deploys to", "")
+Rel(h_nvidia, aws_eks, "deploys to", "GPU nodes")
+Rel(h_gw, aws_eks, "deploys to", "")
+Rel(h_model, aws_eks, "deploys to", "")
+Rel(h_inf, aws_eks, "deploys to", "GPU node group")
+Rel(h_deploy, aws_eks, "deploys to", "")
+Rel(h_batch, aws_eks, "deploys to", "")
+Rel(h_ui, aws_eks, "deploys to", "")
+
+' Vault as cross-cutting concern
+Rel(tf_vault, h_model, "provides secrets to", "Vault Agent Sidecar")
+Rel(tf_vault, h_inf, "provides secrets to", "Dynamic PG credentials")
+Rel(tf_vault, h_deploy, "provides secrets to", "")
+Rel(tf_vault, h_batch, "provides secrets to", "")
+
+@enduml

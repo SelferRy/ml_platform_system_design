@@ -1,0 +1,503 @@
+=== Планы тестирования
+
+ifndef::imagesdir[:imagesdir: {docdir}/../diagrams]
+
+==== Пирамида тестирования для ML Platform
+
+Стандартная пирамида тестирования (unit → integration → e2e) расширяется для ML Platform тремя дополнительными уровнями: contract-тесты (gRPC/REST/Kafka схемы), model validation tests (качество модели при деплое) и chaos tests (устойчивость к отказам). Каждый уровень автоматизирован и интегрирован в CI/CD пайплайн (см. раздел 4.02).
+
+[cols="2,3,2,2,1"]
+|===
+| Уровень | Что тестирует | Когда | Инструмент | Время
+
+| Unit
+| Бизнес-логика: state machine переходы, caching, preprocessing, circuit breaker
+| Каждый PR
+| pytest, go test
+| <2 мин
+
+| Contract
+| gRPC/REST/Kafka schema совместимость, backward compatibility
+| Каждый PR
+| buf lint, spectral, openapi-diff
+| <1 мин
+
+| Integration
+| API flows, tenant isolation, auth/authz, model lifecycle, batch job
+| Каждый PR
+| pytest + httpx, ephemeral namespace
+| 5–10 мин
+
+| Model Validation
+| Accuracy, latency, input/output schema, memory footprint модели
+| При деплое модели
+| Custom Python Job (Kubernetes)
+| 2–15 мин
+
+| Smoke
+| Здоровье системы после каждого деплоя
+| После каждого деплоя
+| pytest / curl
+| <2 мин
+
+| Performance
+| Latency p99, throughput под нагрузкой
+| На staging перед prod
+| k6
+| 10–30 мин
+
+| Chaos
+| Устойчивость к отказам AZ, нодов, Kafka брокеров, GPU подов
+| Еженедельно на staging
+| Chaos Mesh
+| 30–60 мин
+
+| Security
+| Tenant isolation, auth bypass, CVE в образах, секреты в коде
+| Каждый PR + ежемесячно
+| pytest, Trivy, Semgrep
+| 5–15 мин
+|===
+
+NOTE: Model Validation Tests — уникальный уровень для ML Platform, отсутствующий в типичных web-приложениях. Тесты запускаются автоматически как часть FSM перехода `validating` (см. seq-model-deploy.puml), а не как отдельный шаг CI.
+
+==== Unit-тесты
+
+Unit-тесты покрывают бизнес-логику каждого сервиса в изоляции (без внешних зависимостей). Минимальный coverage threshold: ≥80% для core business logic.
+
+===== Model Service (Python/FastAPI)
+
+[cols="2,4"]
+|===
+| Что тестируется | Детали
+
+| State machine переходы
+| Все легальные переходы: `draft→validating`, `validating→staging`, `staging→production`, `production→deprecated`. Все нелегальные переходы → ожидаемый `InvalidStateTransitionError` (например, `draft→production` запрещён)
+
+| Validation logic артефакта
+| Проверка формата (ONNX, TensorRT, SavedModel), размер ≤10 GB, checksum (SHA-256). Тест с файлом >10 GB → ожидаемый rejection
+
+| Tenant isolation
+| Попытка доступа к `model_id` другого tenant → 403. Тест с подменой `tenant_id` в JWT → ожидаемый отказ
+
+| Idempotency key
+| Повторный POST /v1/models с тем же `idempotency_key` → 200 с существующим `model_id`, не дублирует запись
+|===
+
+===== Inference Service (Python/Triton)
+
+[cols="2,4"]
+|===
+| Что тестируется | Детали
+
+| Cache hit/miss/TTL
+| Hit: запрос → кэш возвращает результат, upstream Triton не вызывается. Miss: запрос при пустом кэше → вызов Triton → сохранение в кэш. TTL expiry: устаревшая запись → re-fetch
+
+| Circuit Breaker переходы
+| Closed → Open: при 5 последовательных GPU ошибках. Half-Open: попытка восстановления после cooldown. Open → Closed: успешный probe запрос. Тест с mocked Triton клиентом
+
+| Request routing
+| Правильный выбор Triton endpoint по `model_id + version`. Fallback при недоступности версии → ошибка (не fallback на другую версию без явного указания)
+
+| Input validation
+| Запрос с неверным shape входного тензора → 422 до вызова Triton. Запрос с отсутствующими обязательными полями → 400
+|===
+
+===== Deployment Service (Go/Temporal)
+
+[cols="2,4"]
+|===
+| Что тестируется | Детали
+
+| Temporal workflow unit tests
+| Тесты с mocked activities (Temporal test framework). Проверка последовательности шагов: validate → deploy → health_check → success/rollback
+
+| Rollback logic
+| При каком наборе ошибок активируется откат: health check timeout (>10 мин), pod CrashLoopBackOff ≥3 раз, smoke test fail. Тест с imulated failures на каждом шаге
+
+| Kubernetes API interaction
+| Mocked k8s client (controller-runtime fake client). Тест генерации Helm release, patch Deployment spec, чтение pod status
+|===
+
+===== Batch Workers (Python)
+
+[cols="2,4"]
+|===
+| Что тестируется | Детали
+
+| Chunking логика
+| Dataset 100K записей → разбивка на chunks по N=1000 → 100 корректных chunks. Остаток: 100K+7 записей → 100 полных + 1 chunk из 7
+
+| Error handling и DLQ routing
+| При постоянной ошибке обработки записи после 3 retry → запись отправляется в DLQ топик. Transient ошибка → retry с exponential backoff (1s → 2s → 4s)
+
+| Throughput (CPU-only)
+| Тест производительности на CPU: ≥10K записей/сек для light inference (NFR-107). Используется mocked inference backend
+|===
+
+==== Contract-тесты
+
+Contract-тесты проверяют, что изменения в одном сервисе не нарушают совместимость с потребителями. ML Platform использует три протокола: gRPC (инференс), REST (управление моделями), Kafka (события).
+
+===== gRPC Contract (buf)
+
+[source,bash]
+----
+# Проверка корректности proto schema
+buf lint inference.proto
+
+# Проверка backward compatibility с предыдущей версией
+buf breaking inference.proto --against '.git#tag=v1.2.0'
+----
+
+Правила совместимости для `inference.proto`:
+
+* Запрещено: удаление полей, изменение типов полей, изменение field numbers
+* Разрешено: добавление новых опциональных полей, добавление новых RPC методов
+* При нарушении → CI fail, PR блокируется
+
+===== REST Contract (OpenAPI)
+
+[source,bash]
+----
+# Lint OpenAPI spec на корректность
+spectral lint openapi.yaml
+
+# Проверка на breaking changes относительно предыдущей версии
+openapi-diff openapi-v1.yaml openapi-v2.yaml --fail-on-incompatible
+----
+
+Breaking changes, блокирующие CI: удаление endpoint, удаление обязательного параметра, изменение типа response поля.
+
+===== Kafka Contract (Protobuf Schema Evolution)
+
+Kafka события (`DeploymentRequested`, `DeploymentSucceeded`, `InferenceLogged`) версионируются через Protobuf.
+
+Правило эволюции: только аддитивные изменения (новые `optional` поля). Удаление полей или изменение типов запрещено.
+
+В Baseline: manual review proto файлов через `buf lint` + `buf breaking`. В MVP — Confluent Schema Registry с `BACKWARD` compatibility mode (extension point).
+
+==== Integration-тесты
+
+Integration-тесты запускаются в ephemeral namespace (`pr-{number}`) Kubernetes dev кластера при каждом PR. Namespace содержит все сервисы платформы без GPU нод (Triton в CPU-only режиме). После merge PR namespace удаляется.
+
+===== Сценарий 1: End-to-end Inference Flow
+
+[source]
+----
+1. POST /v1/models {name, framework, artifact_url} → 201 {model_id, state: DRAFT}
+2. POST /v1/models/{id}/deploy → 202 Accepted
+3. Дождаться state=PRODUCTION (polling с таймаутом 5 мин)
+4. POST /v1/infer {model_id, inputs} → 200 {outputs, latency_ms}
+5. POST /v1/infer {model_id, inputs} (тот же запрос) → 200 {cached: true}
+----
+
+Критерии pass: все шаги завершены с ожидаемыми HTTP статусами, второй запрос возвращает `cached: true`.
+
+===== Сценарий 2: Tenant Isolation
+
+[source]
+----
+1. Создать model под tenant-A (token-A)
+2. Попытка GET /v1/models/{model_id} с token-B → 403 или 404
+3. Попытка POST /v1/infer {model_id принадлежащий tenant-A} с token-B → 403
+4. Проверить PostgreSQL RLS: SELECT с tenant_id=B не возвращает записи tenant-A
+----
+
+Критерии pass: все попытки межтенантного доступа отклонены. Этот тест является security gate — fail блокирует PR независимо от остальных тестов.
+
+===== Сценарий 3: Auth/Authz
+
+[source]
+----
+1. API Key: POST /v1/infer с корректным ключом → 200
+2. API Key: POST /v1/infer с невалидным ключом → 401
+3. JWT: GET /v1/models с корректным JWT (роль VIEWER) → 200
+4. JWT: DELETE /v1/models/{id} с ролью VIEWER → 403
+5. JWT: DELETE /v1/models/{id} с ролью ADMIN → 200
+6. Истёкший JWT → 401
+----
+
+===== Сценарий 4: Model Lifecycle (State Machine)
+
+[source]
+----
+1. Создать модель → state=DRAFT
+2. Инициировать деплой → state=VALIDATING
+3. Validation pass (mock) → state=STAGING
+4. Promote to production → state=PRODUCTION
+5. Deprecate → state=DEPRECATED
+6. Попытка инференса устаревшей модели → 410 Gone
+----
+
+===== Сценарий 5: Batch Job
+
+[source]
+----
+1. POST /v1/batch {model_id, dataset_s3_uri} → 202 {job_id}
+2. Kafka: проверить появление сообщения в топике batch-jobs
+3. Polling GET /v1/batch/{job_id}/status до state=COMPLETED (таймаут 5 мин)
+4. GET /v1/batch/{job_id}/results → ссылка на S3 с результатами
+5. Проверить наличие результата в S3 mock (MinIO)
+----
+
+==== Model Validation Tests (ML-специфика)
+
+Model Validation Tests — уровень тестирования, специфичный для ML Platform. Запускаются автоматически как Kubernetes Job в рамках FSM перехода `VALIDATING` (см. diagrams/seq-model-deploy.puml). Результаты сохраняются в `model_versions.validation_results` (PostgreSQL JSONB).
+
+===== Latency Validation
+
+[source,python]
+----
+# 100 sample inference запросов к новой версии модели
+latencies = [infer(sample_input) for _ in range(100)]
+p99 = numpy.percentile(latencies, 99)
+assert p99 <= 100, f"p99 latency {p99}ms превышает NFR-101 порог 100ms"
+----
+
+Порог: p99 ≤100ms (NFR-101). При нарушении → FSM переходит в `VALIDATION_FAILED`, деплой блокируется, ML Engineer получает уведомление с детальным отчётом.
+
+===== Accuracy Validation
+
+Validation dataset хранится в S3: `s3://ml-artifacts-{tenant_id}/models/{model_id}/validation/`. Threshold задаётся при регистрации модели (`min_accuracy: 0.95`).
+
+[source,python]
+----
+dataset = load_from_s3(f"s3://.../validation/dataset.parquet")
+predictions = model.predict(dataset.inputs)
+accuracy = compute_metric(predictions, dataset.labels)
+assert accuracy >= model.config.min_accuracy, \
+    f"Accuracy {accuracy:.3f} ниже порога {model.config.min_accuracy}"
+----
+
+===== Input/Output Schema Validation
+
+Проверка что модель принимает входные данные корректного shape и dtype, возвращает output ожидаемого формата. Используется schema из `model_versions.input_schema` (JSONB).
+
+[source,python]
+----
+schema = load_schema(model_id)
+# Тест с корректным input
+result = infer(generate_sample(schema))
+validate_output_schema(result, schema.output)
+
+# Тест с некорректным shape → ожидаем ошибку валидации
+with pytest.raises(ValidationError):
+    infer(generate_wrong_shape(schema))
+----
+
+===== Memory Footprint
+
+Проверка что модель не превышает лимит GPU memory (критично для multi-model serving на одной GPU).
+
+[source,python]
+----
+gpu_mem_before = get_gpu_memory_used()
+load_model(model_id)
+gpu_mem_after = get_gpu_memory_used()
+used_mb = gpu_mem_after - gpu_mem_before
+assert used_mb <= model.config.max_gpu_memory_mb, \
+    f"GPU memory {used_mb}MB превышает лимит {model.config.max_gpu_memory_mb}MB"
+----
+
+В CPU-only окружении (dev, ephemeral namespace) — тест пропускается (skip), выполняется только на staging с GPU нодами.
+
+==== Smoke-тесты
+
+Smoke-тесты выполняются сразу после каждого деплоя (staging и prod). Максимальное время выполнения: 2 минуты. Fail любого smoke-теста → немедленный `helm rollback` + P1 алерт.
+
+[cols="1,3,2"]
+|===
+| # | Проверка | Ожидаемый результат
+
+| 1
+| `GET /v1/health` (API Gateway)
+| HTTP 200, `{"status": "ok"}`
+
+| 2
+| `GET /v2/health/ready` (Triton Inference Server)
+| HTTP 200, все загруженные модели в состоянии READY
+
+| 3
+| `GET /metrics` (Prometheus scrape endpoint)
+| HTTP 200, содержит метрику `mlp_inference_requests_total`
+
+| 4
+| `POST /v1/infer` с test payload
+| HTTP 200, latency <500ms (расслабленный порог после cold start)
+
+| 5
+| VictoriaMetrics: `mlp_inference_requests_total` rate > 0
+| Метрика увеличивается после smoke-запроса п.4
+
+| 6
+| Loki: нет ERROR логов за последние 2 минуты
+| Loki query возвращает 0 строк с `level=ERROR`
+
+| 7
+| `GET /v1/sys/health` (Vault)
+| HTTP 200, Vault sealed=false, initialized=true
+|===
+
+NOTE: Smoke-тест п.4 использует зарезервированный test-tenant (`tenant_id=smoke-test`) с заранее задеплоенной тестовой моделью. Test-tenant создаётся при bootstrap кластера и не удаляется.
+
+==== Нагрузочное тестирование
+
+Инструмент: k6 (JavaScript). Запускается как Kubernetes Job на staging перед prod деплоем. Результаты публикуются в GitHub Actions job summary и сохраняются в VictoriaMetrics через k6 remote_write.
+
+===== Сценарий 1: Baseline Throughput
+
+[source,javascript]
+----
+// k6 script: baseline-throughput.js
+export const options = {
+  stages: [
+    { duration: '5m', target: 500 },   // Ramp up → 500 RPS
+    { duration: '10m', target: 500 },  // Steady state 500 RPS
+    { duration: '5m', target: 1000 },  // Ramp up → 1000 RPS
+    { duration: '10m', target: 1000 }, // Steady state 1000 RPS
+    { duration: '2m', target: 0 },     // Ramp down
+  ],
+  thresholds: {
+    'http_req_duration{quantile:0.99}': ['p(99)<100'],  // p99 ≤100ms
+    'http_req_failed': ['rate<0.001'],                   // error rate <0.1%
+  },
+};
+----
+
+Критерии pass: p99 latency ≤100ms, error rate <0.1%, 0 circuit breaker opens (проверяется по `mlp_inference_errors_total{type="circuit_open"}`).
+
+===== Сценарий 2: Spike Test (10× нагрузка)
+
+Baseline 200 RPS → резкий рост до 2000 RPS (10× за 30 секунд) → возврат к 200 RPS.
+
+Критерии pass: HPA масштабировался ≤2 мин (`kube_deployment_status_replicas_available` достигло target), p99 ≤200ms в пике (расслабленный порог на время spike), error rate <1%.
+
+===== Сценарий 3: Batch Workers Capacity
+
+Submit 100 batch jobs одновременно, каждый с dataset 10K записей.
+
+Критерии pass: KEDA масштабировал batch workers ≤2 мин (`mlp_batch_jobs_active` растёт), throughput ≥10K записей/сек на worker (NFR-107), все 100 jobs завершены за ≤30 мин (NFR-108 light).
+
+===== Сценарий 4: GPU Model Cold Start
+
+Из состояния scale-to-zero (0 Triton подов) → первый inference запрос.
+
+Критерии pass: latency первого запроса ≤5s (NFR-103: model load time), последующие запросы возвращаются к ≤100ms p99.
+
+NOTE: Сценарии 1 и 2 запускаются на каждый staging деплой. Сценарии 3 и 4 — еженедельно (scheduled), так как требуют дополнительных ресурсов (GPU холодный старт).
+
+==== Chaos-тестирование
+
+Инструмент: Chaos Mesh (оркестрация хаос-экспериментов в Kubernetes). Выполняется еженедельно на staging по расписанию (scheduled pipeline). Результаты публикуются в Grafana дашборд "Chaos Metrics" с baseline vs chaos сравнением.
+
+[cols="1,2,3,2"]
+|===
+| # | Сценарий | Действие и проверка | Ожидаемый результат
+
+| 1
+| Pod Kill (Inference Service)
+| Chaos Mesh убивает случайный Inference Service под каждые 30 секунд в течение 10 минут. Мониторинг error rate и latency
+| HPA восстанавливает реплику ≤2 мин. Traffic не теряется (rolling без downtime). Error rate <0.1% во время эксперимента
+
+| 2
+| AZ Failure Simulation
+| Все ноды в AZ-B маркируются `NoSchedule`, существующие поды эвакуируются
+| Kubernetes перепланирует поды на AZ-A и AZ-C ≤5 мин. SLO availability сохраняется. RDS автоматически переключается на standby replica
+
+| 3
+| Network Latency Injection (+200ms на PostgreSQL)
+| Chaos Mesh добавляет 200ms latency на трафик к PostgreSQL primary
+| Circuit Breaker не активируется (threshold 5s, не 200ms). Read replica принимает часть нагрузки. Inference работает нормально (кэш Redis сглаживает)
+
+| 4
+| GPU Pod Kill
+| Убить Triton под на GPU ноде во время активного трафика
+| Anti-affinity правила гарантируют наличие второго Triton пода на другой GPU ноде. Трафик переключается ≤30 секунд
+
+| 5
+| Kafka Broker Kill
+| Убить 1 из 3 MSK брокеров
+| Kafka продолжает работать (min.ISR=2 из 3 брокеров). Consumer lag не растёт более чем на 5000 сообщений. Производители и потребители переподключаются ≤60 секунд
+|===
+
+Связь с DR планом: chaos-тесты верифицируют RTO показатели из doc/2.10 (DR план). Результаты chaos-тестов используются как доказательство соответствия NFR на code review и при аудите.
+
+==== Управление качеством
+
+[cols="2,2,1,2"]
+|===
+| Активность | Тип | Частота | Ответственный
+
+| Unit tests
+| Автоматически (CI)
+| Каждый PR
+| CI система
+
+| Contract tests (buf, spectral)
+| Автоматически (CI)
+| Каждый PR
+| CI система
+
+| Integration tests (ephemeral namespace)
+| Автоматически (CI)
+| Каждый PR
+| CI система
+
+| Security scan (Trivy CVE, Semgrep SAST)
+| Автоматически (CI)
+| Каждый PR
+| CI система
+
+| Secret scan (gitleaks)
+| Автоматически (pre-commit + CI)
+| Каждый commit
+| CI система
+
+| Tenant isolation test
+| Автоматически (CI — security gate)
+| Каждый PR
+| CI система
+
+| Smoke tests
+| Автоматически (CD)
+| После каждого деплоя
+| CD система
+
+| Performance test (baseline + spike)
+| Автоматически (CD)
+| Перед каждым prod деплоем
+| CD система
+
+| Chaos tests
+| Автоматически (scheduled)
+| Еженедельно (staging)
+| Platform Team
+
+| Model validation tests
+| Автоматически (Kubernetes Job)
+| При каждом деплое модели
+| Deployment Service
+
+| API key rotation audit
+| Автоматически (Alertmanager)
+| Непрерывно
+| Alertmanager → SRE
+
+| Pentest
+| По регламенту
+| Ежеквартально
+| Security Team
+
+| DR drill
+| По регламенту
+| Дважды в год
+| SRE Team
+
+| Model accuracy review
+| По регламенту
+| Ежемесячно
+| ML Engineers
+|===
+
+NOTE: Tenant isolation test (сценарий 2 в Integration-тестах) является mandatory security gate. Fail этого теста блокирует merge PR и не может быть overridden. Единственный способ разблокировать — исправить код и пройти тест. Решение принято в соответствии с требованием NFR-301 (tenant isolation).

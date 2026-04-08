@@ -1,0 +1,88 @@
+@startuml security-rbac
+title Defence in Depth — Enterprise ML Platform (Baseline/Alpha)
+
+skinparam componentStyle rectangle
+skinparam roundcorner 8
+skinparam ArrowThickness 2
+skinparam defaultTextAlignment center
+
+skinparam component {
+    BackgroundColor<<security>> #FFE4B5
+    BorderColor<<security>> #FF8C00
+    BackgroundColor<<storage>> #E0F0FF
+    BorderColor<<storage>> #4488CC
+    BackgroundColor<<service>> #E8F5E9
+    BorderColor<<service>> #388E3C
+    BackgroundColor<<infra>> #F3E5F5
+    BorderColor<<infra>> #7B1FA2
+}
+
+actor "Внешний клиент" as Client
+
+rectangle "Слой 1: Сетевая защита" {
+    component "WAF\n(AWS WAF)\nOWASP Top 10\nSQL Injection, XSS,\nPayload size limit" <<security>> as WAF
+}
+
+rectangle "Слой 2: Аутентификация и Rate Limiting" {
+    component "API Gateway\n(Kong/Envoy)\nTLS termination\nAPI Key / JWT validation\nRate Limiting (Token Bucket)\nTenant resolution" <<security>> as GW
+    component "Redis\n(auth cache)\nHMAC lookup TTL 5 мин\nRate limit counters" <<storage>> as RedisAuth
+    component "IdP\n(Keycloak/Okta)\nOIDC/OAuth 2.0\nJWKS endpoint" <<infra>> as IdP
+}
+
+rectangle "Слой 3: Авторизация (RBAC)" {
+    component "RBAC Middleware\n(API Gateway)\nПроверка роли по ресурсу\nScope: own_tenant / all_tenants" <<security>> as RBAC
+    database "PostgreSQL\n(api_keys, roles,\nrole_assignments)" <<storage>> as PG
+}
+
+rectangle "Слой 4: Сервисный уровень" {
+    component "Model Service" <<service>> as ModelSvc
+    component "Inference Service" <<service>> as InfSvc
+    component "Deployment Service" <<service>> as DepSvc
+    component "K8s ServiceAccount\n+ RBAC\nLeast Privilege:\nInference → read model_versions only" <<infra>> as KubeSA
+}
+
+rectangle "Слой 5: Данные (последний барьер)" {
+    database "PostgreSQL\nRow-Level Security (RLS)\nSET LOCAL app.tenant_id\nПолитика на: models,\nmodel_versions, deployments,\napi_keys" <<storage>> as PGDB
+    component "S3\nПрефиксы tenants/{id}/\nIAM policy per tenant\nAES-256 SSE-KMS" <<storage>> as S3
+    component "Redis Cache\nKey prefix: {tenant_id}:*\nЛогическая изоляция" <<storage>> as RedisCache
+}
+
+rectangle "Управление секретами (cross-cutting)" {
+    component "HashiCorp Vault\nKV v2 · Dynamic Secrets (PG)\nPKI engine · Transit (envelope)\nK8s Auth · Vault Agent Sidecar\nAudit log встроен" <<security>> as Vault
+}
+
+Client --> WAF : HTTPS
+WAF --> GW : Filtered request
+GW --> RedisAuth : HMAC / rate limit check
+GW --> IdP : JWKS (RS256 key fetch, cache 1h)
+GW --> RBAC : Authenticated request\n+ tenant_id + role
+RBAC --> PG : Role lookup (cache in Redis)
+RBAC --> ModelSvc : Authorized request
+RBAC --> InfSvc : Authorized request
+RBAC --> DepSvc : Authorized request
+
+ModelSvc --> KubeSA
+InfSvc --> KubeSA
+DepSvc --> KubeSA
+
+ModelSvc --> PGDB : SQL + RLS enforced
+InfSvc --> RedisCache : tenant-prefixed key
+InfSvc --> PGDB : SQL + RLS enforced
+DepSvc --> PGDB : SQL + RLS enforced
+InfSvc --> S3 : tenants/{id}/models/
+
+KubeSA --> Vault : K8s Auth (ServiceAccount JWT)
+Vault --> ModelSvc : Dynamic PG credentials\n(TTL 1h, auto-rotate)
+Vault --> InfSvc : Dynamic PG credentials
+Vault --> DepSvc : Dynamic PG credentials
+
+note right of Vault
+  OPA (Open Policy Agent) —
+  extension point для MVP.
+  В Baseline: policy enforcement
+  в RBAC Middleware.
+  mTLS (Istio) — extension point MVP.
+  Baseline: K8s NetworkPolicy.
+end note
+
+@enduml

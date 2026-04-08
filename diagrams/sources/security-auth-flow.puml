@@ -1,0 +1,90 @@
+@startuml security-auth-flow
+title Аутентификация — Enterprise ML Platform (Baseline/Alpha)
+
+skinparam sequenceArrowThickness 2
+skinparam roundcorner 5
+skinparam sequenceParticipant underline
+
+actor "Клиент\n(M2M / сервис)" as Client
+actor "Пользователь\n(браузер)" as Browser
+participant "API Gateway\n(Kong/Envoy)" as GW
+participant "Redis\n(auth cache)" as RedisAuth
+database "PostgreSQL\n(api_keys)" as PG
+participant "IdP\n(Keycloak/Okta)" as IdP
+
+== Alt 1: Machine-to-Machine (API Key) ==
+
+Client -> GW : HTTPS POST /v1/infer\nAuthorization: Bearer mlp_<base62-32bytes>
+
+GW -> RedisAuth : GET api_key_hmac:{sha256(key)}\nTTL 5 мин
+
+alt Cache Hit (≤1ms)
+    RedisAuth --> GW : {tenant_id, permissions, expires_at}
+else Cache Miss
+    RedisAuth --> GW : nil
+    GW -> PG : SELECT tenant_id, permissions, revoked\nFROM api_keys WHERE hmac = hmac_sha256(key)
+    alt Key revoked или не найден
+        PG --> GW : no rows / revoked=true
+        GW --> Client : 401 Unauthorized
+    else Key valid
+        PG --> GW : {tenant_id, permissions, expires_at}
+        GW -> RedisAuth : SET api_key_hmac:{sha256(key)} {payload}\nEX 300 (TTL 5 мин)
+    end
+end
+
+GW --> Client : Request forwarded\n(tenant_id, permissions в headers)
+
+note right of GW
+  Ротация ключа: Redis TTL <= 5 мин.
+  При revoke: PG revoked=true → Redis
+  override TTL=0 (NFR-403).
+end note
+
+== Alt 2: Human (OAuth 2.0 / OIDC, Authorization Code + PKCE) ==
+
+Browser -> IdP : GET /authorize\n?response_type=code&client_id=mlp\n&code_challenge=<S256>&redirect_uri=...
+
+note right of IdP
+  IdP: внешний провайдер
+  (Keycloak / Okta / Azure AD).
+  Описан в doc/2.04.
+end note
+
+IdP --> Browser : Login page
+Browser -> IdP : POST credentials
+IdP --> Browser : 302 redirect\n?code=<auth_code>
+
+Browser -> GW : POST /auth/token\n{code, code_verifier, redirect_uri}
+GW -> IdP : POST /token\n{code, code_verifier, client_secret}
+IdP --> GW : {access_token (JWT RS256, TTL 15 мин),\nrefresh_token (TTL 7 дней)}
+
+note right of GW
+  JWT validation: подпись RS256,
+  claims: exp, iss, aud.
+  Публичные ключи IdP — JWKS cache TTL 1ч.
+end note
+
+GW -> GW : Verify JWT signature\n(JWKS cache, RS256)
+GW --> Browser : 200 OK\n{access_token}\nSet-Cookie: refresh_token=...; HttpOnly; Secure
+
+Browser -> GW : GET /v1/models\nAuthorization: Bearer <access_token>
+GW -> GW : Verify JWT (exp, iss, aud, RS256)
+GW --> Browser : 200 OK {models}
+
+== Token Refresh (Access Token Expired) ==
+
+Browser -> GW : GET /v1/models\nAuthorization: Bearer <expired_token>
+GW --> Browser : 401 Unauthorized\nWWW-Authenticate: Bearer error="invalid_token"
+
+Browser -> IdP : POST /token\n{grant_type=refresh_token,\nrefresh_token=<cookie>}
+IdP --> Browser : {new access_token (TTL 15 мин)}
+Browser -> GW : GET /v1/models\nAuthorization: Bearer <new_token>
+GW --> Browser : 200 OK {models}
+
+note over Client, IdP
+  SSO (SAML 2.0 / корпоративный IdP) — extension point для MVP.
+  Подключается без изменений в платформе: IdP меняется,
+  протокол OIDC остаётся.
+end note
+
+@enduml

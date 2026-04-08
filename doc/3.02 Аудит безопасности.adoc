@@ -1,0 +1,321 @@
+=== Аудит безопасности
+
+==== Архитектура аудит-лога
+
+Общий observability-стек (Fluent Bit → Loki → S3) описан в doc/2.09. Здесь — специфика audit-log как отдельного потока с повышенными требованиями к надёжности и retention.
+
+===== Разделение audit-log от application-log
+
+Audit-log выделен в отдельный Loki stream `{job="audit", env="prod"}`. Причина: различные требования к retention, доступу и формату:
+
+[cols="2,2,2,2"]
+|===
+| Параметр | Application Log | Audit Log | Обоснование
+
+| Hot retention (Loki)
+| 30 дней
+| 1 год
+| NFR-404 + compliance: аудит должен быть оперативно доступен для расследования
+
+| Cold retention (S3 Glacier)
+| 1 год
+| 7 лет
+| Regulatory compliance; финансовые и ML-системы требуют хранения журналов аудита
+
+| Доступ
+| Platform Team, SRE
+| ML Platform Admin, SRE (read-only)
+| Audit logs не должны быть доступны рядовым разработчикам
+
+| Формат
+| Structured JSON, произвольные поля
+| Строгая JSON-схема (см. ниже)
+| Предсказуемая структура для automated compliance scanning
+|===
+
+===== Структура события аудита (JSON Schema)
+
+[source,json]
+----
+{
+  "event_id": "uuid-v4",               // Уникальный идентификатор события
+  "timestamp": "2025-04-05T10:00:00Z", // ISO 8601 UTC — всегда UTC
+  "event_type": "auth.login",          // Категория.действие (см. таблицу ниже)
+  "actor": "usr-abc-123",              // ID субъекта: user_id / service_id / api_key_id
+  "actor_type": "user",                // user | service | api_key
+  "tenant_id": "tenant-42",            // Тенант, к которому относится событие
+  "resource_type": "model",            // model | deployment | api_key | role | batch_job
+  "resource_id": "mdl-xyz-789",        // ID ресурса (null для событий без ресурса)
+  "action": "read",                    // create | read | update | delete | call | login | revoke
+  "outcome": "success",                // success | failure
+  "reason": null,                      // Причина failure (null при success)
+  "source_ip": "203.0.113.42",         // IP клиента (из X-Forwarded-For)
+  "request_id": "req-abc-123",         // Корреляция с application log
+  "metadata": {                        // Дополнительный контекст (опционально)
+    "model_version": "1.2.0",
+    "previous_role": "data_scientist"  // Для admin.role_change
+  }
+}
+----
+
+===== Типы событий аудита
+
+[cols="2,3,2"]
+|===
+| event_type | Когда записывается | Критичность
+
+| `auth.login`
+| Успешная аутентификация (API Key verify, OAuth token issue)
+| INFO
+
+| `auth.login_failed`
+| Неуспешная аутентификация (неверный ключ, истёкший токен)
+| WARN
+
+| `auth.token_refresh`
+| Обновление access token через refresh token
+| INFO
+
+| `auth.key_revoked`
+| Отзыв API-ключа (вручную или по истечению)
+| WARN
+
+| `authz.denied`
+| Отклонённый запрос авторизации (403 Forbidden)
+| WARN
+
+| `data.model_read`
+| Чтение метаданных модели или артефактов
+| INFO (только для privileged roles)
+
+| `data.model_write`
+| Создание, обновление, удаление модели или версии
+| INFO
+
+| `data.inference_call`
+| Вызов inference API (аномальный объём — см. мониторинг)
+| INFO (sample rate 1%)
+
+| `admin.role_change`
+| Изменение роли или прав пользователя
+| CRITICAL
+
+| `admin.tenant_change`
+| Создание, изменение, деактивация тенанта
+| CRITICAL
+
+| `secret.rotation`
+| Ротация API-ключа, сертификата, DB credentials
+| INFO
+
+| `secret.access_anomaly`
+| Аномальный доступ к секретам Vault (>порога за период)
+| CRITICAL
+|===
+
+===== Гарантии доставки
+
+Подход: **at-least-once** (дубликаты допустимы, потеря записей недопустима).
+
+. API Gateway / сервисы пишут событие **синхронно** в таблицу `audit_log` в PostgreSQL (WAL-backed, атомарно с бизнес-операцией)
+. Fluent Bit читает логи из stdout — async экспорт в Loki
+. Debezium (CDC) читает PostgreSQL WAL и публикует события в Kafka топик `audit-events` — для backup-экспорта в S3 Glacier
+. `event_id` (UUID v4) — защита от дубликатов при re-delivery
+
+NOTE: Запись в PostgreSQL `audit_log` — единственная синхронная операция. Всё остальное (Loki, S3) — asynchronous best-effort с гарантией через WAL/CDC.
+
+==== Мониторинг аномального поведения
+
+Метрики безопасности — отдельный дашборд "Security" в Grafana поверх общего observability-стека (doc/2.09). Alertmanager маршрутизация та же: P0/P1 → PagerDuty, P2 → мессенджер команды.
+
+===== Метрики безопасности
+
+[cols="3,2,2,2,2"]
+|===
+| Метрика | Тип | Порог P0/P1 | Порог P2 | Обоснование
+
+| `mlp_auth_failures_total` +
+`{reason="invalid_key", tenant_id}`
+| Counter
+| rate >50/мин per tenant → P1
+| rate >20/мин per tenant → P2
+| Признак перебора API-ключей
+
+| `mlp_authz_denied_total` +
+`{tenant_id, resource_type}`
+| Counter
+| rate >100/мин → P1
+| rate >30/мин → P2
+| Попытки несанкционированного доступа / ошибка в логике клиента
+
+| `mlp_inference_calls_total` +
+`{tenant_id}` vs baseline
+| Counter
+| >300% от baseline за 5 мин → P1 (компрометация ключа)
+| >200% за 10 мин → P2
+| Аномальный всплеск = вероятная компрометация API-ключа
+
+| `mlp_vault_secret_access_total`
+| Counter
+| rate >1000/мин → P1
+| —
+| Аномальный доступ к секретам; возможная атака изнутри
+
+| `mlp_tls_handshake_errors_total`
+| Counter
+| rate >100/мин → P1
+| rate >30/мин → P2
+| Атаки на TLS: downgrade, MITM попытки
+
+| `mlp_api_key_rotation_overdue`
+| Gauge
+| >0 ключей старше 90 дней → P1
+| —
+| Нарушение политики ротации NFR-403; P1 т.к. каждый просроченный ключ — риск
+
+| `mlp_tenant_isolation_violations_total`
+| Counter
+| **>0 → P0** (любое нарушение)
+| —
+| Критический инцидент: нарушение изоляции тенантов = утечка данных
+|===
+
+NOTE: Метрики `mlp_auth_failures_total`, `mlp_authz_denied_total`, `mlp_vault_secret_access_total`, `mlp_tls_handshake_errors_total`, `mlp_api_key_rotation_overdue`, `mlp_tenant_isolation_violations_total` — кастомные метрики, выставляются API Gateway и соответствующими сервисами. `mlp_inference_calls_total` — уже существует (doc/2.09), добавляется alert на аномалию.
+
+===== Пример правил алертов
+
+[source,yaml]
+----
+groups:
+  - name: security
+    rules:
+    - alert: APIKeyBruteForce
+      expr: |
+        rate(mlp_auth_failures_total{reason="invalid_key"}[5m]) > 50/60
+      for: 2m
+      labels:
+        severity: P1
+      annotations:
+        summary: "Возможный перебор API-ключей: {{ $labels.tenant_id }}"
+        runbook_url: "https://wiki/runbooks/api-key-bruteforce"
+
+    - alert: TenantIsolationViolation
+      expr: mlp_tenant_isolation_violations_total > 0
+      for: 0m
+      labels:
+        severity: P0
+      annotations:
+        summary: "КРИТИЧНО: нарушение изоляции тенантов"
+        runbook_url: "https://wiki/runbooks/tenant-isolation-violation"
+
+    - alert: InferenceCallsAnomaly
+      expr: |
+        rate(mlp_inference_calls_total[5m]) >
+        3 * avg_over_time(rate(mlp_inference_calls_total[1h])[1d:5m])
+      for: 5m
+      labels:
+        severity: P1
+      annotations:
+        summary: "Аномальный всплеск inference: {{ $labels.tenant_id }}"
+        description: "Возможная компрометация API-ключа тенанта"
+        runbook_url: "https://wiki/runbooks/inference-anomaly"
+
+    - alert: APIKeyRotationOverdue
+      expr: mlp_api_key_rotation_overdue > 0
+      for: 1h
+      labels:
+        severity: P1
+      annotations:
+        summary: "API-ключи с истёкшим сроком ротации: {{ $value }} ключей"
+        runbook_url: "https://wiki/runbooks/api-key-rotation"
+----
+
+==== Runbook: Реагирование на security-инциденты
+
+Общий жизненный цикл инцидента описан в doc/2.10. Здесь — специфика security-инцидентов.
+
+===== Runbook: Компрометация API-ключа
+
+*Симптом*: Алерт `APIKeyBruteForce` или `InferenceCallsAnomaly`. Внезапный spike inference от тенанта.
+
+*Шаги:*
+
+[source,bash]
+----
+# 1. Определить затронутый ключ через audit log
+# LogQL запрос в Grafana → Loki:
+# {job="audit"} | json | event_type="auth.login" | tenant_id="<tenant>"
+# | line_format "{{.actor}} {{.source_ip}} {{.timestamp}}"
+
+# 2. Немедленно отозвать ключ через API
+curl -X DELETE https://api.mlplatform/v1/api-keys/<key_id> \
+  -H "Authorization: Bearer <admin_token>"
+
+# 3. Принудительная инвалидация Redis (если API недоступен)
+kubectl exec -n ml-platform redis-0 -- redis-cli DEL "api_key_hmac:<sha256>"
+
+# 4. Проверить объём несанкционированного доступа
+# LogQL: {job="audit"} | json | actor="<api_key_id>" | action="call"
+# | stats count() by resource_id — за период аномалии
+
+# 5. Уведомить тенанта о необходимости создать новый ключ
+----
+
+*RTO*: <5 минут от обнаружения до инвалидации. *Постфактум*: аудит-лог для определения полного объёма несанкционированного доступа.
+
+===== Runbook: Нарушение изоляции тенантов (P0)
+
+*Симптом*: Алерт `TenantIsolationViolation` (`mlp_tenant_isolation_violations_total > 0`). P0 — любое значение > 0.
+
+*Шаги:*
+
+[source,bash]
+----
+# 1. Немедленная изоляция затронутого сервиса
+kubectl cordon <node-name> -n ml-platform
+kubectl scale deployment <service-name> --replicas=0 -n ml-platform
+
+# 2. Forensic audit — определить что утекло
+# LogQL: {job="audit"} | json | tenant_id="<victim_tenant>"
+# | actor_tenant != tenant_id — запросы от чужого тенанта
+
+# 3. Проверить PostgreSQL RLS политики
+kubectl exec -n ml-platform postgres-0 -- psql -U admin \
+  -c "SELECT * FROM pg_policies WHERE tablename='models';"
+
+# 4. Уведомить: Management + затронутых тенантов (GDPR/compliance)
+# Срок уведомления: 72 часа (GDPR Art. 33)
+
+# 5. Postmortem за 48 часов
+----
+
+*RTO*: <2 минуты до изоляции сервиса.
+
+===== Runbook: Истечение TLS-сертификата
+
+*Симптом*: cert-manager event `CertificateNotReady` или алерт на expiry (cert-manager встроенный алерт). Этот сценарий означает сбой автоматики cert-manager.
+
+*Шаги:*
+
+[source,bash]
+----
+# 1. Проверить статус сертификата
+kubectl get certificate -n ml-platform
+kubectl describe certificate <cert-name> -n ml-platform
+
+# 2. Принудительный renewal
+kubectl annotate certificate <cert-name> -n ml-platform \
+  cert-manager.io/issue-temporary-certificate="true"
+
+# Или через cmctl CLI
+cmctl renew <cert-name> -n ml-platform
+
+# 3. Проверить что сертификат обновился
+kubectl get secret <tls-secret> -n ml-platform \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d | openssl x509 -noout -dates
+
+# 4. При проблеме с Vault PKI — проверить Vault статус
+kubectl exec -n vault vault-0 -- vault status
+----
+
+*Профилактика*: cert-manager настроен на renewal за 30 дней до истечения (NFR-403). Мониторинг cert-manager events через alerting rule `CertificateExpiryWarning`.
